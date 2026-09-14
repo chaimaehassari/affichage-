@@ -1,0 +1,25 @@
+# Fichiers de construction Gradle
+.gradle/
+build/
+*/build/
+
+# Fichier de configuration local (contient le secret de licence — NE JAMAIS COMMITTER)
+local.properties
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# APK
+*.apk
+*.aab

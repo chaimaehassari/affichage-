@@ -1,0 +1,68 @@
+from datetime import datetime, timedelta, timezone
+import hmac
+
+import jwt
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError, VerificationError
+
+from app.core.config import get_settings
+from app.core.times import now_app
+
+settings = get_settings()
+
+ph = PasswordHasher(
+    time_cost=3,
+    memory_cost=65536,
+    parallelism=4,
+    hash_len=32,
+    salt_len=16,
+)
+
+
+def hash_password(password: str) -> str:
+    return ph.hash(password)
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    try:
+        ph.verify(password_hash, password)
+        return True
+    except (VerifyMismatchError, VerificationError):
+        return False
+
+
+def create_access_token(user_id: int) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    payload = {
+        "sub": str(user_id),
+        "exp": expire,
+    }
+    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
+def decode_access_token(token: str) -> dict | None:
+    try:
+        payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+        return payload
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+
+
+def verify_supreme_admin_code(code: str, username: str | None = None) -> bool:
+    """Vérifie le code admin suprême.
+
+    Le seul mécanisme valide est le code JJMMAAAA (date brute du jour dans le
+    fuseau de l'application, ex. 03092026). Aucun code HMAC n'est généré :
+    l'opérateur saisit simplement la date du jour.
+    """
+    # Le nom d'utilisateur (nom/le login) n'est jamais un code valide.
+    if username and code.strip().lower() == username.strip().lower():
+        return False
+    stripped = code.strip()
+
+    # Date brute du jour au format JJMMAAAA dans le fuseau de l'application
+    # (heure locale du serveur, ou fuseau configuré via APP_TIMEZONE).
+    today_raw = now_app().strftime("%d%m%Y")
+    return hmac.compare_digest(stripped, today_raw)

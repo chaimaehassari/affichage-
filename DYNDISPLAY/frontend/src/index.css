@@ -1,0 +1,122 @@
+@import "tailwindcss";
+
+@theme {
+  --color-primary-50: #eff6ff;
+  --color-primary-100: #dbeafe;
+  --color-primary-200: #bfdbfe;
+  --color-primary-300: #93c5fd;
+  --color-primary-400: #60a5fa;
+  --color-primary-500: #3b82f6;
+  --color-primary-600: #2563eb;
+  --color-primary-700: #1d4ed8;
+  --color-primary-800: #1e40af;
+  --color-primary-900: #1e3a8a;
+  --color-primary-950: #172554;
+
+  --color-dark-50: #f8fafc;
+  --color-dark-100: #f1f5f9;
+  --color-dark-200: #e2e8f0;
+  --color-dark-300: #cbd5e1;
+  --color-dark-400: #94a3b8;
+  --color-dark-500: #64748b;
+  --color-dark-600: #475569;
+  --color-dark-700: #334155;
+  --color-dark-800: #1e293b;
+  --color-dark-900: #0f172a;
+  --color-dark-950: #020617;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+}
+
+html.light { color-scheme: light; }
+html.light body { background-color: #f0f2f5; }
+
+/* ---- Surfaces (selecteurs par attribut : robustes a la minification) ---- */
+html.light [class~="bg-[#0b0d10]"] { background-color: #f0f2f5; }
+html.light [class~="bg-[#0f1217]"] { background-color: #edf1f6; }
+html.light [class~="bg-[#111418]"] { background-color: #ffffff; }
+html.light [class~="bg-[#111418]/80"] { background-color: #ffffff; }
+html.light [class~="bg-[#111418]/60"] { background-color: rgba(255,255,255,0.85); }
+html.light [class~="bg-[#111418]/40"] { background-color: rgba(255,255,255,0.75); }
+html.light [class~="bg-[#1a1f24]"] { background-color: #ffffff; }
+html.light [class~="bg-[#1a1f24]/80"] { background-color: #ffffff; }
+html.light [class~="bg-[#1a1a1a]"] { background-color: #ffffff; }
+html.light [class~="bg-[#2a2f36]"] { background-color: #eef1f5; }
+html.light [class~="bg-[#3a3646]"] { background-color: #dde3ea; }
+html.light .bg-white\/5 { background-color: rgba(0,0,0,0.05); }
+html.light .bg-white\/10 { background-color: rgba(0,0,0,0.08); }
+
+/* ---- Vignette radiale des fonds de page ---- */
+html.light [class~="bg-[radial-gradient(ellipse_at_center,transparent_30%,#0b0d10_100%)]"] {
+  background-image: radial-gradient(ellipse at center, transparent 30%, #e6eaf0 100%);
+}
+
+/* ---- Degrades d'arriere-plan des pages vitrines ---- */
+html.light .bg-gradient-to-br {
+  background-image: linear-gradient(160deg, #eef1f6, #f7f9fc 50%, #e8ecf2);
+}
+html.light .theme-pattern { background-image: none !important; }
+html.light .theme-vignette {
+  background: radial-gradient(ellipse at center, transparent 30%, #e6eaf0 100%) !important;
+}
+
+/* ---- Texte ---- */
+html.light .text-white { color: #1f2937; }
+html.light .text-white\/40 { color: rgba(0,0,0,0.45); }
+html.light .text-white\/70 { color: rgba(0,0,0,0.70); }
+html.light .text-white\/80 { color: rgba(0,0,0,0.75); }
+html.light .text-\[#a0a7b3\] { color: #6b7280; }
+html.light .text-\[#f6c200\] { color: #b58900; }
+html.light .text-\[#ffdb4d\] { color: #c9991e; }
+html.light .hover\:text-white:hover { color: #111827; }
+html.light .hover\:text-\[#f6c200\]:hover { color: #a16207; }
+
+/* ---- Tableaux : textes clairement visibles en mode clair ---- */
+html.light table thead th { color: #475569; }
+html.light table tbody td { color: #111827; }
+html.light table [class~="text-white"] { color: #111827; }
+html.light table [class~="text-[#a0a7b3]"] { color: #4b5563; }
+
+/* Statuts / badges dans les tableaux : teintes foncees lisibles sur fond clair */
+html.light table [class~="text-emerald-300"] { color: #047857; }
+html.light table [class~="text-green-300"] { color: #166534; }
+html.light table [class~="text-red-300"] { color: #b91c1c; }
+html.light table [class~="text-yellow-300"] { color: #a16207; }
+html.light table [class~="text-blue-300"] { color: #1d4ed8; }
+html.light table [class~="text-purple-300"] { color: #6d28d9; }
+html.light table [class~="text-zinc-400"] { color: #52525b; }
+
+/* Icones / boutons de la colonne Actions et statuts hors tableaux */
+html.light [class~="text-emerald-400"]:not([class*="950/"]) { color: #059669; }
+html.light [class~="text-green-400"]:not([class*="950/"]) { color: #16a34a; }
+html.light [class~="text-blue-400"]:not([class*="950/"]) { color: #2563eb; }
+html.light [class~="text-red-400"]:not([class*="950/"]) { color: #dc2626; }
+html.light [class~="hover:text-red-400"]:hover, html.light [class~="hover:text-emerald-300"]:hover { color: #dc2626; }
+html.light [class~="text-emerald-300"]:not([class*="950/"]), html.light [class~="text-green-300"]:not([class*="950/"]) { color: #047857; }
+html.light [class~="text-red-300"]:not([class*="950/"]) { color: #b91c1c; }
+html.light [class~="text-yellow-300"]:not([class*="950/"]) { color: #a16207; }
+html.light [class~="text-blue-300"]:not([class*="950/"]), html.light [class~="text-purple-300"]:not([class*="950/"]) { color: #1d4ed8; }
+html.light [class~="text-zinc-400"]:not([class*="950/"]) { color: #52525b; }
+
+/* ---- Bordures ---- */
+html.light .border-white { border-color: rgba(0,0,0,0.15); }
+html.light .border-white\/5 { border-color: rgba(0,0,0,0.08); }
+html.light .border-white\/6 { border-color: rgba(0,0,0,0.08); }
+html.light .border-white\/10 { border-color: rgba(0,0,0,0.12); }
+html.light .border-white\/20 { border-color: rgba(0,0,0,0.20); }
+
+/* ---- Bouton du selecteur de theme ---- */
+html.light .theme-toggle {
+  background-color: #ffffff;
+  border-color: rgba(0,0,0,0.12);
+  color: #374151;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+}

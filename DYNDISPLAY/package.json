@@ -1,0 +1,17 @@
+{
+  "name": "dyndisplay",
+  "version": "1.0.0",
+  "description": "DYNDISPLAY - Digital Signage Management (Web)",
+  "license": "Proprietary",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -k -n WEB,BACKEND \"npm:dev:web\" \"npm:dev:backend\"",
+    "dev:web": "cd frontend && npm run dev",
+    "dev:backend": "cd backend && python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000",
+    "build": "cd frontend && npm run build",
+    "start": "cd backend && python -m uvicorn app.main:app --host 0.0.0.0 --port 8000"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.0"
+  }
+}

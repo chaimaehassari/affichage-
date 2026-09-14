@@ -1,0 +1,12 @@
+# Copier ce fichier vers local.properties et renseigner les vraies valeurs.
+#
+# Ne JAMAIS commit ce fichier — il contient le secret de licence.
+# Il est exclu par .gitignore par défaut dans Android Studio.
+#
+# sdk.dir = chemin vers le SDK Android (ex: C\:\\Users\\hp\\AppData\\Local\\Android\\Sdk)
+#           Peut être omis si Android Studio détecte automatiquement le SDK.
+# license.secret = secret HMAC utilisé pour générer les codes de licence.
+#                  Même valeur que LICENSE_SECRET dans backend/.env (DYNDISPLAY).
+
+sdk.dir=C\:\\Users\\hp\\AppData\\Local\\Android\\Sdk
+license.secret=REMPLACER-PAR-LE-VRAI-SECRET

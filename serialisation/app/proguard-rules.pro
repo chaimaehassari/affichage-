@@ -1,0 +1,1 @@
+# Keep default rules (no reflection used). Nothing license-related needs keeping.

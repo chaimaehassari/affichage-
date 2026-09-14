@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Licence T2F</string>
+    <string name="subtitle">Générateur interne de codes de licence\n(Ce code est confidentiel — ne sera publié hors des appareils T2F)</string>
+    <string name="hint_code">Code client</string>
+    <string name="hint_sites">Nombre de sites</string>
+    <string name="hint_posts">Nombre de postes</string>
+    <string name="btn_generate">Générer</string>
+    <string name="btn_copy">Copier le code</string>
+    <string name="section_decode">Vérifier / décoder une licence</string>
+    <string name="hint_code_to_check">Code de licence à vérifier</string>
+    <string name="btn_validate">Vérifier</string>
+    <string name="copied">Code copié.</string>
+    <string name="err_code_required">Code client requis (chiffres uniquement)</string>
+    <string name="err_sites_required">Nombre de sites invalide</string>
+    <string name="err_posts_required">Nombre de postes invalide</string>
+    <string name="decode_invalid">Code invalide : la signature ne correspond pas ou le format est incorrect.</string>
+    <string name="decode_valid">Code valide.\nClient : %1$s\nSites : %2$d\nPostes : %3$d</string>
+</resources>
