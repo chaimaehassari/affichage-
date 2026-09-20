@@ -12,8 +12,26 @@ from app.schemas.configuration import (
     ZoneMediaAssignment,
 )
 from app.services.configuration_service import ConfigurationService, ScheduleService
+from app.services.scope import assert_post_scope
 
 router = APIRouter(prefix="/api/v1", tags=["Configuration"])
+
+
+def _assert_schedule_scope(db, current_user, schedule_id: int) -> None:
+    row = db.execute(
+        "SELECT post_id FROM schedules WHERE schedule_id = %s",
+        (schedule_id,),
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Planning introuvable.")
+    _assert_post_scope(db, current_user, row["post_id"])
+
+
+def _assert_post_scope(db, current_user, post_id: int) -> None:
+    try:
+        assert_post_scope(db, current_user, post_id)
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
 
 
 @router.get("/posts/{post_id}/configuration", response_model=PostConfigurationOut)
@@ -22,6 +40,7 @@ def get_post_configuration(
     current_user=Depends(require_permission("menu_config")),
     db: Connection = Depends(get_db),
 ):
+    _assert_post_scope(db, current_user, post_id)
     service = ConfigurationService(db)
     result = service.get_configuration(post_id)
     if not result:
@@ -36,6 +55,7 @@ def update_post_configuration(
     current_user=Depends(require_permission("menu_config")),
     db: Connection = Depends(get_db),
 ):
+    _assert_post_scope(db, current_user, post_id)
     service = ConfigurationService(db)
     try:
         return service.update_configuration(post_id, data, user_id=current_user.user_id)
@@ -52,6 +72,7 @@ def update_post_zones(
     current_user=Depends(require_permission("menu_config")),
     db: Connection = Depends(get_db),
 ):
+    _assert_post_scope(db, current_user, post_id)
     service = ConfigurationService(db)
     try:
         service.update_zones(post_id, zones, user_id=current_user.user_id)
@@ -68,6 +89,7 @@ def list_schedules(
     current_user=Depends(require_permission("menu_config")),
     db: Connection = Depends(get_db),
 ):
+    _assert_post_scope(db, current_user, post_id)
     service = ScheduleService(db)
     return service.list_schedules(post_id)
 
@@ -79,6 +101,7 @@ def create_schedule(
     current_user=Depends(require_permission("menu_config")),
     db: Connection = Depends(get_db),
 ):
+    _assert_post_scope(db, current_user, post_id)
     service = ScheduleService(db)
     try:
         return service.create_schedule(post_id, data)
@@ -93,6 +116,7 @@ def update_schedule(
     current_user=Depends(require_permission("menu_config")),
     db: Connection = Depends(get_db),
 ):
+    _assert_schedule_scope(db, current_user, schedule_id)
     service = ScheduleService(db)
     try:
         return service.update_schedule(schedule_id, data)
@@ -106,6 +130,7 @@ def delete_schedule(
     current_user=Depends(require_permission("menu_config")),
     db: Connection = Depends(get_db),
 ):
+    _assert_schedule_scope(db, current_user, schedule_id)
     service = ScheduleService(db)
     try:
         service.delete_schedule(schedule_id)

@@ -10,6 +10,7 @@ from app.db.database import get_db, connect_new
 from app.dependencies.auth import require_permission
 from app.schemas.sync import SyncJobOut, SyncJobCreate
 from app.services.sync_service import SyncService
+from app.services.scope import assert_group_access, assert_post_scope
 from app.core.times import to_utc
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,8 @@ def start_sync(
     db: Connection = Depends(get_db),
 ):
     service = SyncService(db)
+
+    assert_post_scope(db, current_user, post_id)
 
     post = db.execute(
         "SELECT post_id FROM posts WHERE post_id = %s",
@@ -118,6 +121,8 @@ def get_sync_job(
     if not job:
         raise HTTPException(status_code=404, detail="Job de synchronisation introuvable.")
 
+    assert_post_scope(db, current_user, job["post_id"])
+
     return _job_out(job, _job_items(db, job_id))
 
 
@@ -127,6 +132,8 @@ def get_post_sync_status(
     current_user=Depends(require_permission("menu_sync")),
     db: Connection = Depends(get_db),
 ):
+    assert_post_scope(db, current_user, post_id)
+
     job = db.execute(
         """
         SELECT * FROM sync_jobs
@@ -150,6 +157,11 @@ def sync_group(
     db: Connection = Depends(get_db),
 ):
     service = SyncService(db)
+
+    try:
+        assert_group_access(db, current_user, group_id)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
 
     group = db.execute(
         "SELECT group_id FROM screen_groups WHERE group_id = %s",
@@ -190,6 +202,10 @@ def get_group_media_hierarchy(
     db: Connection = Depends(get_db),
 ):
     service = SyncService(db)
+    try:
+        assert_group_access(db, current_user, group_id)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     group = db.execute(
         "SELECT group_id FROM screen_groups WHERE group_id = %s",
         (group_id,),
@@ -206,6 +222,10 @@ def get_group_media_sync_status(
     db: Connection = Depends(get_db),
 ):
     service = SyncService(db)
+    try:
+        assert_group_access(db, current_user, group_id)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     group = db.execute(
         "SELECT group_id FROM screen_groups WHERE group_id = %s",
         (group_id,),
@@ -223,6 +243,11 @@ def sync_group_media(
     db: Connection = Depends(get_db),
 ):
     service = SyncService(db)
+
+    try:
+        assert_group_access(db, current_user, group_id)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
 
     group = db.execute(
         "SELECT group_id FROM screen_groups WHERE group_id = %s",
@@ -301,6 +326,7 @@ def get_config_preview(
     db: Connection = Depends(get_db),
 ):
     service = SyncService(db)
+    assert_post_scope(db, current_user, post_id)
     try:
         config = service.generate_config(post_id)
     except ValueError as e:

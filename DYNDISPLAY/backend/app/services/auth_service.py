@@ -40,6 +40,14 @@ def _build_user_info(conn: Connection, user_row: dict) -> UserInfo:
         ).fetchall()
     ]
 
+    groups = [
+        r["group_id"]
+        for r in conn.execute(
+            "SELECT group_id FROM user_group_access WHERE user_id = %s AND is_allowed = TRUE",
+            (user_row["user_id"],),
+        ).fetchall()
+    ]
+
     return UserInfo(
         user_id=user_row["user_id"],
         login=user_row["login"],
@@ -50,11 +58,16 @@ def _build_user_info(conn: Connection, user_row: dict) -> UserInfo:
         profile_id=user_row["profile_id"],
         permissions=permissions,
         zones=zones,
+        groups=groups,
         user_code=user_row.get("user_code"),
         is_activated=bool(user_row.get("is_activated", True)),
+        is_superadmin=bool(user_row.get("is_superadmin", False)),
         sites_limit=user_row.get("sites_limit"),
         posts_limit=user_row.get("posts_limit"),
         activated_at=user_row["activated_at"].isoformat() if user_row.get("activated_at") else None,
+        requires_activation=bool(user_row.get("requires_activation", False)),
+        account_code=user_row.get("account_code"),
+        authorized_device_id=user_row.get("authorized_device_id"),
     )
 
 
@@ -226,3 +239,147 @@ class AuthService:
             (user_id,),
         ).fetchone()
         return _build_user_info(self.conn, user)
+
+    # --- Activation par compte et liaison à un appareil (migration 016) ---
+
+    def _get_license_posts(self, client_id: int) -> int:
+        """Quota de postes du client (`clients.license_posts`).
+
+        Depuis la migration 019, tout compte est rattaché à un client
+        (users.client_id NOT NULL) : aucun repli sur un quota global.
+        """
+        row = self.conn.execute(
+            "SELECT license_posts FROM clients WHERE id = %s",
+            (client_id,),
+        ).fetchone()
+        if not row:
+            raise ValueError("Ce compte n'est rattaché à aucun client.")
+        return int(row["license_posts"] or 0)
+
+    def _count_activated_accounts(self, client_id: int) -> int:
+        """Comptes activés du client (même rattachement client, hors Super Admin)."""
+        row = self.conn.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM users
+            WHERE client_id = %s
+              AND requires_activation = FALSE
+              AND COALESCE(is_superadmin, FALSE) = FALSE
+            """,
+            (client_id,),
+        ).fetchone()
+        return row["cnt"] or 0
+
+    def ensure_account_code(self, user_row: dict) -> str:
+        """Garantit qu'un compte (ancien ou nouveau) possède un account_code.
+
+        Rétrocompatibilité : les comptes créés avant la migration 016 n'ont pas
+        d'account_code ; on en génère un à la volée puis on le stocke.
+        """
+        account_code = user_row.get("account_code")
+        if account_code:
+            return account_code
+        from app.core.license_utils import generate_account_code
+        account_code = generate_account_code()
+        self.conn.execute(
+            "UPDATE users SET account_code = %s WHERE user_id = %s",
+            (account_code, user_row["user_id"]),
+        )
+        return account_code
+
+    def bind_device(self, user_id: int, device_id: str) -> None:
+        self.conn.execute(
+            """
+            UPDATE users
+            SET authorized_device_id = %s, updated_at = %s
+            WHERE user_id = %s
+            """,
+            (device_id, datetime.now(timezone.utc), user_id),
+        )
+        self.conn.commit()
+
+    def activate_device_account(self, login: str, activation_code: str, device_id: str) -> dict:
+        """Active un compte avec un code d'activation et le lie à un appareil.
+
+        - Si le compte attend une activation (requires_activation), l'activation
+          consomme un slot de licence postes (si le quota n'est pas déjà atteint).
+        - Si le compte est déjà activé (changement / reliaison d'appareil),
+          l'activation est gratuite (ne consomme pas de slot).
+        """
+        from app.core.license_utils import (
+            fp6_from_string,
+            verify_activation_code,
+        )
+        from app.services.audit_service import log_action
+
+        if not device_id or not device_id.strip():
+            raise ValueError("L'identifiant de l'appareil (X-Device-Id) est obligatoire.")
+
+        user = self.conn.execute(
+            """
+            SELECT u.*, p.name AS profile_name
+            FROM users u
+            LEFT JOIN profiles p ON p.profile_id = u.profile_id
+            WHERE u.login = %s
+            """,
+            (login,),
+        ).fetchone()
+        if not user:
+            raise ValueError("Utilisateur introuvable.")
+        if user.get("is_superadmin"):
+            raise ValueError("Le compte admin suprême n'a pas besoin d'être activé.")
+
+        account_code = self.ensure_account_code(user)
+
+        fp6 = fp6_from_string(account_code)
+        info = verify_activation_code(activation_code, fp6)
+        if info is None:
+            raise ValueError("Code d'activation invalide.")
+        if not info.valid:
+            raise ValueError("Ce code d'activation ne correspond pas au compte.")
+        if info.expires_at < datetime.now(timezone.utc):
+            raise ValueError("Ce code d'activation a expiré.")
+
+        first_activation = bool(user.get("requires_activation"))
+        if first_activation:
+            client_id = user.get("client_id")
+            if not client_id:
+                raise ValueError("Ce compte n'est rattaché à aucun client : activation impossible.")
+            quota = self._get_license_posts(client_id)
+            used = self._count_activated_accounts(client_id)
+            if used >= quota:
+                raise ValueError(
+                    f"Quota de postes atteint ({used}/{quota}). "
+                    "Contactez le fournisseur pour augmenter votre licence."
+                )
+
+        now = datetime.now(timezone.utc)
+        self.conn.execute(
+            """
+            UPDATE users
+            SET requires_activation = FALSE, authorized_device_id = %s,
+                activated_at = COALESCE(activated_at, %s), updated_at = %s
+            WHERE user_id = %s
+            """,
+            (device_id, now, now, user["user_id"]),
+        )
+        action = "account_activation" if first_activation else "device_relink"
+        description = (
+            f"Activation du compte {login} et liaison à l'appareil {device_id}"
+            if first_activation
+            else f"Reliaison du compte {login} à l'appareil {device_id}"
+        )
+        log_action(self.conn, user["user_id"], action, "user", user["user_id"], description)
+        self.conn.commit()
+
+        return {
+            "success": True,
+            "user_id": user["user_id"],
+            "login": login,
+            "account_code": account_code,
+            "first_activation": first_activation,
+            "message": (
+                "Compte activé et appareil lié." if first_activation
+                else "Appareil relié au compte."
+            ),
+        }

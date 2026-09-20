@@ -30,7 +30,7 @@ from app.schemas.site import (
     SiteUpdate,
 )
 from app.services.site_service import GroupService, MediaService, PostService, SiteService
-from app.services.scope import client_scope
+from app.services.scope import client_scope, group_scope, assert_group_access, is_admin
 from app.sftp.client import SFTPClient
 
 router = APIRouter(prefix="/api/v1", tags=["Sites, Posts, Groups"])
@@ -69,18 +69,22 @@ def _post_out(post) -> PostOut:
     )
 
 
-def _group_out(group, db: Connection, scope: str | None = None) -> GroupOut:
-    if scope:
-        post_count = db.execute(
-            """
+def _group_out(group, db: Connection, scope=None) -> GroupOut:
+    if scope is not None and scope != "":
+        from app.services.scope import scope_sql
+        sql = """
             SELECT COUNT(*) AS cnt
             FROM screen_group_posts gp
             JOIN posts p ON p.post_id = gp.post_id
             JOIN sites s ON s.site_id = p.site_id
-            WHERE gp.group_id = %s AND s.client_code = %s
-            """,
-            (group["group_id"], scope),
-        ).fetchone()["cnt"] or 0
+            WHERE gp.group_id = %s
+        """
+        params = [group["group_id"]]
+        frag, args = scope_sql(scope, "s.client_code")
+        if frag:
+            sql += frag
+        params.extend(args)
+        post_count = db.execute(sql, params).fetchone()["cnt"] or 0
     else:
         post_count = db.execute(
             "SELECT COUNT(*) AS cnt FROM screen_group_posts WHERE group_id = %s",
@@ -123,7 +127,7 @@ def list_sites(
     db: Connection = Depends(get_db),
 ):
     service = SiteService(db)
-    return [_site_out(s) for s in service.list_sites(search, client_scope(current_user))]
+    return [_site_out(s) for s in service.list_sites(search, client_scope(db, current_user))]
 
 
 @router.post("/sites", response_model=SiteOut, status_code=201)
@@ -135,7 +139,7 @@ def create_site(
     service = SiteService(db)
     try:
         site = service.create_site(data, admin_user_id=current_user.user_id,
-                                   scope=client_scope(current_user))
+                                   scope=client_scope(db, current_user))
         return _site_out(site)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -148,7 +152,7 @@ def get_site(
     db: Connection = Depends(get_db),
 ):
     service = SiteService(db)
-    site = service.get_site(site_id, client_scope(current_user))
+    site = service.get_site(site_id, client_scope(db, current_user))
     if not site:
         raise HTTPException(status_code=404, detail="Site introuvable.")
     return _site_out(site)
@@ -164,7 +168,7 @@ def update_site(
     service = SiteService(db)
     try:
         site = service.update_site(site_id, data, admin_user_id=current_user.user_id,
-                                   scope=client_scope(current_user))
+                                   scope=client_scope(db, current_user))
         return _site_out(site)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -179,7 +183,7 @@ def delete_site(
     service = SiteService(db)
     try:
         service.delete_site(site_id, admin_user_id=current_user.user_id,
-                            scope=client_scope(current_user))
+                            scope=client_scope(db, current_user))
         return MessageResponse(message="Site supprimé avec succès.")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -195,7 +199,7 @@ def list_posts(
     db: Connection = Depends(get_db),
 ):
     service = PostService(db)
-    return [_post_out(p) for p in service.list_posts(site_id, search, client_scope(current_user))]
+    return [_post_out(p) for p in service.list_posts(site_id, search, client_scope(db, current_user))]
 
 
 @router.post("/posts", response_model=PostOut, status_code=201)
@@ -207,7 +211,7 @@ def create_post(
     service = PostService(db)
     try:
         post = service.create_post(data, admin_user_id=current_user.user_id,
-                                   scope=client_scope(current_user))
+                                   scope=client_scope(db, current_user))
         return _post_out(post)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -220,7 +224,7 @@ def get_post(
     db: Connection = Depends(get_db),
 ):
     service = PostService(db)
-    post = service.get_post(post_id, client_scope(current_user))
+    post = service.get_post(post_id, client_scope(db, current_user))
     if not post:
         raise HTTPException(status_code=404, detail="Poste introuvable.")
     return _post_out(post)
@@ -236,7 +240,7 @@ def update_post(
     service = PostService(db)
     try:
         post = service.update_post(post_id, data, admin_user_id=current_user.user_id,
-                                   scope=client_scope(current_user))
+                                   scope=client_scope(db, current_user))
         return _post_out(post)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -251,7 +255,7 @@ def delete_post(
     service = PostService(db)
     try:
         service.delete_post(post_id, admin_user_id=current_user.user_id,
-                            scope=client_scope(current_user))
+                            scope=client_scope(db, current_user))
         return MessageResponse(message="Poste supprimé avec succès.")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -268,7 +272,7 @@ def batch_assign_media(
     service = PostService(db)
     try:
         result = service.batch_assign_media(data, admin_user_id=current_user.user_id,
-                                            scope=client_scope(current_user))
+                                            scope=client_scope(db, current_user))
     except PermissionError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     return BatchAssignResponse(**result)
@@ -282,7 +286,8 @@ def list_groups(
     db: Connection = Depends(get_db),
 ):
     service = GroupService(db)
-    return [_group_out(g, db, client_scope(current_user)) for g in service.list_groups()]
+    allowed = group_scope(db, current_user)
+    return [_group_out(g, db, client_scope(db, current_user)) for g in service.list_groups(allowed_group_ids=allowed)]
 
 
 @router.post("/groups", response_model=GroupOut, status_code=201)
@@ -293,7 +298,11 @@ def create_group(
 ):
     service = GroupService(db)
     try:
-        group = service.create_group(data, admin_user_id=current_user.user_id)
+        group = service.create_group(
+            data,
+            admin_user_id=current_user.user_id,
+            assign_to_user=None if is_admin(current_user) else current_user.user_id,
+        )
         return GroupOut(
             group_id=group["group_id"],
             name=group["name"],
@@ -314,10 +323,14 @@ def get_group(
     db: Connection = Depends(get_db),
 ):
     service = GroupService(db)
+    try:
+        assert_group_access(db, current_user, group_id)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     group = service.get_group(group_id)
     if not group:
         raise HTTPException(status_code=404, detail="Groupe introuvable.")
-    return _group_out(group, db, client_scope(current_user))
+    return _group_out(group, db, client_scope(db, current_user))
 
 
 @router.put("/groups/{group_id}", response_model=GroupOut)
@@ -329,8 +342,11 @@ def update_group(
 ):
     service = GroupService(db)
     try:
+        assert_group_access(db, current_user, group_id)
         group = service.update_group(group_id, data, admin_user_id=current_user.user_id)
-        return _group_out(group, db, client_scope(current_user))
+        return _group_out(group, db, client_scope(db, current_user))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -343,8 +359,11 @@ def delete_group(
 ):
     service = GroupService(db)
     try:
+        assert_group_access(db, current_user, group_id)
         service.delete_group(group_id, admin_user_id=current_user.user_id)
         return MessageResponse(message="Groupe supprimé avec succès.")
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -358,10 +377,14 @@ def get_group_posts(
     db: Connection = Depends(get_db),
 ):
     service = GroupService(db)
+    try:
+        assert_group_access(db, current_user, group_id)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     group = service.get_group(group_id)
     if not group:
         raise HTTPException(status_code=404, detail="Groupe introuvable.")
-    return service.get_group_posts(group_id, client_scope(current_user))
+    return service.get_group_posts(group_id, client_scope(db, current_user))
 
 
 @router.post("/groups/{group_id}/posts", response_model=MessageResponse)
@@ -373,9 +396,12 @@ def add_posts_to_group(
 ):
     service = GroupService(db)
     try:
+        assert_group_access(db, current_user, group_id)
         service.add_posts_to_group(group_id, data.post_ids, admin_user_id=current_user.user_id,
-                                   scope=client_scope(current_user))
+                                   scope=client_scope(db, current_user))
         return MessageResponse(message="Postes ajoutés au groupe.")
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -389,9 +415,12 @@ def remove_posts_from_group(
 ):
     service = GroupService(db)
     try:
+        assert_group_access(db, current_user, group_id)
         service.remove_posts_from_group(group_id, data.post_ids, admin_user_id=current_user.user_id,
-                                        scope=client_scope(current_user))
+                                        scope=client_scope(db, current_user))
         return MessageResponse(message="Postes retirés du groupe.")
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -405,7 +434,11 @@ def get_group_composition(
     db: Connection = Depends(get_db),
 ):
     service = GroupService(db)
-    result = service.get_group_composition(group_id, client_scope(current_user))
+    try:
+        assert_group_access(db, current_user, group_id)
+        result = service.get_group_composition(group_id, client_scope(db, current_user))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     if not result:
         raise HTTPException(status_code=404, detail="Groupe introuvable.")
     return result
@@ -420,10 +453,13 @@ def set_group_membership(
 ):
     service = GroupService(db)
     try:
+        assert_group_access(db, current_user, group_id)
         return service.set_group_membership(
             group_id, data.post_ids, admin_user_id=current_user.user_id,
-            scope=client_scope(current_user),
+            scope=client_scope(db, current_user),
         )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -439,9 +475,10 @@ def apply_group_configuration(
 ):
     service = GroupService(db)
     try:
+        assert_group_access(db, current_user, group_id)
         return service.apply_configuration_to_group(
             group_id, data, admin_user_id=current_user.user_id,
-            scope=client_scope(current_user),
+            scope=client_scope(db, current_user),
         )
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
@@ -458,7 +495,7 @@ def list_media(
     db: Connection = Depends(get_db),
 ):
     service = MediaService(db)
-    return [_media_out(m) for m in service.list_media(media_type, client_scope(current_user))]
+    return [_media_out(m) for m in service.list_media(media_type, client_scope(db, current_user))]
 
 
 @router.get("/media/{media_id}", response_model=MediaOut)
@@ -468,7 +505,7 @@ def get_media(
     db: Connection = Depends(get_db),
 ):
     service = MediaService(db)
-    media = service.get_media(media_id, client_scope(current_user))
+    media = service.get_media(media_id, client_scope(db, current_user))
     if not media:
         raise HTTPException(status_code=404, detail="Média introuvable.")
     return _media_out(media)
@@ -501,7 +538,7 @@ async def upload_media(
         SELECT media_id FROM media
         WHERE checksum = %s AND client_code IS NOT DISTINCT FROM %s
         """,
-        (checksum, client_scope(current_user)),
+        (checksum, client_scope(db, current_user)),
     ).fetchone()
     if existing:
         raise HTTPException(status_code=409, detail="Ce fichier existe déjà dans la médiathèque.")
@@ -578,7 +615,7 @@ async def upload_media(
             stored_remote,
             checksum,
             page_count if is_pdf else None,
-            client_scope(current_user),
+            client_scope(db, current_user),
         ),
     ).fetchone()
 
@@ -594,7 +631,7 @@ def delete_media(
     service = MediaService(db)
     try:
         service.delete_media(media_id, admin_user_id=current_user.user_id,
-                             scope=client_scope(current_user))
+                             scope=client_scope(db, current_user))
         return MessageResponse(message="Média supprimé avec succès.")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

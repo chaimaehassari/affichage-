@@ -8,8 +8,9 @@ import requests
 
 BASE_URL = "http://localhost:8000"
 ADMIN_LOGIN = "admin"
-ADMIN_PASSWORD = "admin123"
-DB_URL = "postgresql://postgres:chaimae@127.0.0.1:5433/DYNDISPLAY"
+from tests._test_config import get_test_admin_password, get_test_db_url
+ADMIN_PASSWORD = get_test_admin_password()
+DB_URL = get_test_db_url()
 
 JWT_SECRET_KEY = "dyndisplay-dev-secret-key-change-in-production-2024"
 JWT_ALGORITHM = "HS256"
@@ -156,8 +157,11 @@ def test_auth10_password_hash_is_argon2():
 
 # ---------------------------------------------------------------------------
 # AUTH-SUPREME: Supreme Admin login via main login screen
-# (existing username + day's code in the password field)
+# (existing username + day's code + fixed secret in the password field)
 # ---------------------------------------------------------------------------
+
+# Suffixe secret fixe, identique à SUPREME_ADMIN_SECRET dans le .env du serveur.
+_SUPREME_SECRET = "X7K9"
 
 # fmt: off
 def _today_raw():
@@ -170,9 +174,13 @@ def _other_day_raw():
     return (datetime.now().astimezone() + timedelta(days=1)).strftime("%d%m%Y")
 
 
+def _today_code():
+    return _today_raw() + _SUPREME_SECRET
+
+
 @pytest.mark.v1
-def test_auth_supreme_valid_raw_date_existing_user():
-    r = _api("POST", "/api/v1/auth/login", json={"login": ADMIN_LOGIN, "password": _today_raw()})
+def test_auth_supreme_valid_code_existing_user():
+    r = _api("POST", "/api/v1/auth/login", json={"login": ADMIN_LOGIN, "password": _today_code()})
     assert r.status_code == 200, r.text
     body = r.json()
     assert "access_token" in body
@@ -184,29 +192,44 @@ def test_auth_supreme_valid_raw_date_existing_user():
 
 
 @pytest.mark.v1
+def test_auth_supreme_raw_date_alone_rejected():
+    # La date seule (JJMMAAAA) n'est plus un code valide : le suffixe secret est requis.
+    r = _api("POST", "/api/v1/auth/login", json={"login": ADMIN_LOGIN, "password": _today_raw()})
+    assert r.status_code == 401, r.text
+
+
+@pytest.mark.v1
+def test_auth_supreme_wrong_secret_rejected():
+    # Date du jour + mauvais secret -> rejeté.
+    r = _api("POST", "/api/v1/auth/login",
+             json={"login": ADMIN_LOGIN, "password": _today_raw() + "AAAA"})
+    assert r.status_code == 401, r.text
+
+
+@pytest.mark.v1
 def test_auth_supreme_valid_raw_date_nonexistent_user_rejected():
     r = _api("POST", "/api/v1/auth/login",
-             json={"login": "certainly_does_not_exist_zz", "password": _today_raw()})
+             json={"login": "certainly_does_not_exist_zz", "password": _today_code()})
     assert r.status_code == 401
     assert "detail" in r.json()
 
 
 @pytest.mark.v1
-def test_auth_supreme_other_day_raw_date_rejected():
-    r = _api("POST", "/api/v1/auth/login", json={"login": ADMIN_LOGIN, "password": _other_day_raw()})
+def test_auth_supreme_other_day_code_rejected():
+    r = _api("POST", "/api/v1/auth/login", json={"login": ADMIN_LOGIN, "password": _other_day_raw() + _SUPREME_SECRET})
     assert r.status_code == 401
 
 
 @pytest.mark.v1
 def test_auth_supreme_hardcoded_hmac_code_rejected():
-    # L'ancien code HMAC à 6 chiffres n'est plus accepté : seule la date brute compte.
+    # L'ancien code HMAC à 6 chiffres n'est plus accepté.
     r = _api("POST", "/api/v1/auth/login", json={"login": ADMIN_LOGIN, "password": "783897"})
     assert r.status_code == 401
 
 
 @pytest.mark.v1
 def test_auth_supreme_login_is_audited():
-    r = _api("POST", "/api/v1/auth/login", json={"login": ADMIN_LOGIN, "password": _today_raw()})
+    r = _api("POST", "/api/v1/auth/login", json={"login": ADMIN_LOGIN, "password": _today_code()})
     assert r.status_code == 200
     with psycopg.connect(DB_URL) as conn:
         row = conn.execute(

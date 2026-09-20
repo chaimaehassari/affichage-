@@ -49,3 +49,11 @@ export async function regenerateClientCode() {
 export async function verifyAccessPassword(password) {
   return apiService.post(`${PREFIX}/settings/verify-access`, { password });
 }
+
+export async function getAccountDevices() {
+  return apiService.get(`${PREFIX}/settings/accounts/devices`);
+}
+
+export async function revokeDeviceAccount(userId) {
+  return apiService.post(`${PREFIX}/settings/accounts/${userId}/revoke-device`);
+}

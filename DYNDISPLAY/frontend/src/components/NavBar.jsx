@@ -21,7 +21,7 @@ const mainItems = [
 
 export default function NavBar() {
   const navigate = useNavigate();
-  const { user, hasPermission } = useAuth();
+  const { user, hasPermission, isSuperAdmin } = useAuth();
   const [openMenu, setOpenMenu] = useState(null);
   const navRef = useRef(null);
 
@@ -52,6 +52,7 @@ export default function NavBar() {
   }
 
   function isItemVisible(item) {
+    if (item.superAdminOnly) return !!isSuperAdmin;
     if (!item.permission) return true;
     if (user?.profile_name === 'Administrateur') return true;
     return hasPermission(item.permission);

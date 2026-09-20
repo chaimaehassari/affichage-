@@ -1,4 +1,10 @@
-"""Seed V2 test data for demonstration."""
+"""Seed V2 test data for demonstration.
+
+Aucun mot de passe n'est en dur : le compte admin reprend SEED_ADMIN_PASSWORD
+(pour rester cohérent avec seed_admin.py) et les comptes de démo reçoivent un
+mot de passe aléatoire fort, affiché UNE SEULE FOIS à leur création.
+"""
+import secrets
 import sys
 import os
 
@@ -11,7 +17,6 @@ TEST_USERS = [
     {
         "user_code": "U001",
         "login": "admin",
-        "password": "admin123",
         "profile_name": "Administrateur",
         "is_active": True,
         "zones": [1, 2, 3, 4, 5, 6, 7, 8],
@@ -20,7 +25,6 @@ TEST_USERS = [
     {
         "user_code": "U002",
         "login": "supervisor1",
-        "password": "Sup@1234",
         "profile_name": "Superviseur",
         "is_active": True,
         "zones": [1, 2, 3, 4],
@@ -31,7 +35,6 @@ TEST_USERS = [
     {
         "user_code": "U003",
         "login": "operator1",
-        "password": "Oper@1234",
         "profile_name": "Utilisateur",
         "is_active": True,
         "zones": [1, 2, 3],
@@ -42,7 +45,6 @@ TEST_USERS = [
     {
         "user_code": "U004",
         "login": "operator2",
-        "password": "Oper@1234",
         "profile_name": "Utilisateur",
         "is_active": True,
         "zones": [5, 6],
@@ -53,7 +55,6 @@ TEST_USERS = [
     {
         "user_code": "U005",
         "login": "viewer1",
-        "password": "View@1234",
         "profile_name": "Superviseur",
         "is_active": True,
         "zones": [1, 2],
@@ -64,7 +65,6 @@ TEST_USERS = [
     {
         "user_code": "U006",
         "login": "inactive1",
-        "password": "Inact@123",
         "profile_name": "Utilisateur",
         "is_active": False,
         "zones": [1],
@@ -73,6 +73,14 @@ TEST_USERS = [
         "site_perms": {},
     },
 ]
+
+
+def _password_for(login: str) -> str:
+    """Mot de passe du compte : SEED_ADMIN_PASSWORD pour admin (cohérence
+    seed_admin.py + tests), sinon aléatoire fort, jamais une valeur en dur."""
+    if login == "admin":
+        return os.environ.get("SEED_ADMIN_PASSWORD") or secrets.token_urlsafe(18)
+    return secrets.token_urlsafe(14)
 
 
 def seed():
@@ -95,23 +103,26 @@ def seed():
                     print(f"  Profile '{data['profile_name']}' not found, skipping {data['login']}")
                     continue
 
+                password = _password_for(data["login"])
                 user = conn.execute(
                     """
-                    INSERT INTO users (profile_id, user_code, login, password_hash, is_active, must_change_password)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    INSERT INTO users (profile_id, user_code, login, password_hash, is_active, must_change_password, is_superadmin, requires_activation, client_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE, (SELECT id FROM clients ORDER BY id LIMIT 1))
                     RETURNING user_id
                     """,
                     (
                         profile["profile_id"],
                         data["user_code"],
                         data["login"],
-                        hash_password(data["password"]),
+                        hash_password(password),
                         data["is_active"],
                         True if data["login"] != "admin" else False,
+                        True if data["login"] == "admin" else False,
                     ),
                 ).fetchone()
                 user_id = user["user_id"]
                 print(f"  Created user: {data['login']} (id={user_id}, profile={data['profile_name']})")
+                print(f"    password: {password}  <-- à conserver EN UN SEUL exemplaire")
 
                 for zone in data["zones"]:
                     conn.execute(

@@ -14,6 +14,7 @@ import DisplayConfig from './pages/DisplayConfig'
 import SyncPage from './pages/SyncPage'
 import Supervision from './pages/Supervision'
 import Settings from './pages/Settings'
+import Admins from './pages/Admins'
 import ProtectedRoute from './routes/ProtectedRoute'
 import PermissionRoute from './routes/PermissionRoute'
 import ConnectionBanner from './components/ConnectionBanner'
@@ -34,6 +35,7 @@ export default function App() {
               <Route path="/users" element={<PermissionRoute permission="user_list"><UserList /></PermissionRoute>} />
               <Route path="/users/new" element={<PermissionRoute permission="user_create"><UserForm /></PermissionRoute>} />
               <Route path="/users/:id/edit" element={<PermissionRoute permission="user_update"><UserForm /></PermissionRoute>} />
+              <Route path="/admins" element={<Admins />} />
               <Route path="/sites-posts" element={<PermissionRoute permission="list_sites_posts"><SitesPosts /></PermissionRoute>} />
               <Route path="/batch-assign" element={<PermissionRoute permission="list_sites_posts"><BatchAssign /></PermissionRoute>} />
               <Route path="/media" element={<PermissionRoute permission="menu_media"><MediaLibrary /></PermissionRoute>} />

@@ -1,5 +1,6 @@
 from psycopg import Connection
 import psycopg
+from datetime import datetime, timezone
 
 from app.core.license_utils import validate_license
 
@@ -152,6 +153,87 @@ class SettingsService:
             "SELECT COUNT(*) AS cnt FROM posts WHERE is_active = TRUE"
         ).fetchone()["cnt"]
         return {"used_sites": site_count, "used_posts": post_count}
+
+    # --- Activation par compte / appareils (migration 016) ---
+
+    def get_license_posts(self) -> int:
+        value = self._get("license_posts")
+        if value:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                pass
+        return 200
+
+    def count_activated_accounts(self) -> int:
+        row = self.conn.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM users
+            WHERE requires_activation = FALSE AND COALESCE(is_superadmin, FALSE) = FALSE
+            """
+        ).fetchone()
+        return row["cnt"] or 0
+
+    def list_account_devices(self) -> list[dict]:
+        rows = self.conn.execute(
+            """
+            SELECT u.user_id, u.login, u.user_code, u.account_code,
+                   u.requires_activation, u.authorized_device_id,
+                   u.activated_at, u.created_at,
+                   COALESCE(p.name, '') AS profile_name
+            FROM users u
+            LEFT JOIN profiles p ON p.profile_id = u.profile_id
+            WHERE COALESCE(u.is_superadmin, FALSE) = FALSE
+            ORDER BY u.user_id
+            """
+        ).fetchall()
+        return [
+            {
+                "user_id": r["user_id"],
+                "login": r["login"],
+                "user_code": r["user_code"],
+                "profile_name": r["profile_name"],
+                "account_code": r["account_code"],
+                "requires_activation": bool(r["requires_activation"]),
+                "authorized_device_id": r["authorized_device_id"],
+                "activated_at": r["activated_at"].isoformat() if r["activated_at"] else None,
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+            for r in rows
+        ]
+
+    def revoke_device(self, user_id: int) -> dict | None:
+        """Libère l'appareil lié à un compte (appelé par le Super Admin).
+
+        Le slot de licence n'est ni libéré ni reconsommé : le compte reste
+        dans son état d'activation actuel. Le prochain appareil qui se
+        connectera avec ce compte sera simplement autorisé pour ce compte.
+        """
+        user = self.conn.execute(
+            "SELECT user_id, is_superadmin, requires_activation FROM users WHERE user_id = %s",
+            (user_id,),
+        ).fetchone()
+        if not user:
+            return None
+        if user["is_superadmin"]:
+            raise ValueError("L'admin suprême n'est pas lié à un appareil.")
+
+        self.conn.execute(
+            """
+            UPDATE users
+            SET authorized_device_id = NULL, updated_at = %s
+            WHERE user_id = %s
+            """,
+            (datetime.now(timezone.utc), user_id),
+        )
+        self.conn.commit()
+        return {
+            "user_id": user_id,
+            "activated": not user["requires_activation"],
+            "requires_activation": bool(user["requires_activation"]),
+            "authorized_device_id": None,
+        }
 
 
 class FtpProfileService:

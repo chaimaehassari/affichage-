@@ -8,7 +8,8 @@ import pytest
 import requests
 
 BASE_URL = "http://localhost:8000"
-DB_URL = "postgresql://postgres:chaimae@127.0.0.1:5433/DYNDISPLAY"
+from tests._test_config import get_test_db_url
+DB_URL = get_test_db_url()
 
 SFTP_PATH = "C:\\DYNDISPLAY-SFTP"
 POST_ID = 7
@@ -277,7 +278,7 @@ def _make_site_post():
     """Create a dedicated site + post via a committed connection."""
     with psycopg.connect(DB_URL) as conn:
         site = conn.execute(
-            "INSERT INTO sites (code, name, is_active) VALUES (%s, %s, TRUE) RETURNING site_id",
+            "INSERT INTO sites (code, name, is_active, client_id) VALUES (%s, %s, TRUE, (SELECT id FROM clients ORDER BY id LIMIT 1)) RETURNING site_id",
             (f"AS{uuid.uuid4().hex[:6].upper()}", "AutoSync Site"),
         ).fetchone()
         site_id = site[0]

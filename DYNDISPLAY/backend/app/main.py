@@ -8,9 +8,11 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 from app.core.config import get_settings
 from app.db.database import init_db, close_db
-from app.dependencies.auth import require_activated
+from app.dependencies.auth import require_activated, require_media_access
+from app.schemas.auth import UserInfo
 from app.api.routes.auth import router as auth_router
 from app.api.routes.users import router as users_router
+from app.api.routes.admins import router as admins_router
 from app.api.routes.sites import router as sites_router
 from app.api.routes.layouts import router as layouts_router
 from app.api.routes.configuration import router as configuration_router
@@ -50,6 +52,7 @@ app.add_middleware(
 
 app.include_router(auth_router)
 app.include_router(users_router, dependencies=[Depends(require_activated)])
+app.include_router(admins_router, dependencies=[Depends(require_activated)])
 app.include_router(sites_router, dependencies=[Depends(require_activated)])
 app.include_router(layouts_router, dependencies=[Depends(require_activated)])
 app.include_router(configuration_router, dependencies=[Depends(require_activated)])
@@ -67,7 +70,22 @@ def _media_stream(remote_path: str):
 
 
 @app.get("/media/{path:path}")
-def serve_media(path: str):
+def serve_media(
+    path: str,
+    current_user: UserInfo = Depends(require_media_access),
+):
+    """Sert un média depuis le stockage SFTP, pour les aperçus web.
+
+    PROTÉGÉ PAR JWT : la route exige un token valide (en-tête Authorization
+    OU paramètre `token` — requis pour les balises <img>/<video>). Justification
+    de ne PAS l'exposer publiquement :
+      - les players (Android, Windows) lisent directement le partage SFTP et
+        n'utilisent JAMAIS cette route HTTP — aucun usage légitime public ;
+      - les seuls consommateurs sont les écrans de prévisualisation du
+        frontend (sessions authentifiées) ;
+      - le token en query est le JWT court vécu (< ACCESS_TOKEN_EXPIRE_MINUTES),
+        conforme à un accès signé à durée limitée.
+    """
     clean_path = path.lstrip("/")
     root = settings.SFTP_ROOT_PATH.rstrip("/")
     remote_path = f"{root}/{clean_path}"

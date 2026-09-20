@@ -5,7 +5,9 @@ import pytest
 import requests
 
 BASE_URL = "http://localhost:8000"
-DB_URL = "postgresql://postgres:chaimae@127.0.0.1:5433/DYNDISPLAY"
+from tests._test_config import get_test_admin_password, get_test_db_url
+DB_URL = get_test_db_url()
+ADMIN_PASSWORD = get_test_admin_password()
 
 
 def _api(method, path, **kwargs):
@@ -21,7 +23,7 @@ def _make_site_post():
     Returns (site_id, post_id) as ints."""
     with psycopg.connect(DB_URL) as conn:
         site = conn.execute(
-            "INSERT INTO sites (code, name, is_active) VALUES (%s, %s, TRUE) RETURNING site_id",
+            "INSERT INTO sites (code, name, is_active, client_id) VALUES (%s, %s, TRUE, (SELECT id FROM clients ORDER BY id LIMIT 1)) RETURNING site_id",
             (f"S{uuid.uuid4().hex[:6].upper()}", "V8 Site"),
         ).fetchone()
         site_id = site[0]
@@ -119,7 +121,7 @@ class TestSuper07Ping:
     def _make_post_with_ip(self, ip):
         with psycopg.connect(DB_URL) as conn:
             site = conn.execute(
-                "INSERT INTO sites (code, name, is_active) VALUES (%s, %s, TRUE) RETURNING site_id",
+                "INSERT INTO sites (code, name, is_active, client_id) VALUES (%s, %s, TRUE, (SELECT id FROM clients ORDER BY id LIMIT 1)) RETURNING site_id",
                 (f"S{uuid.uuid4().hex[:6].upper()}", "V8 Ping Site"),
             ).fetchone()
             site_id = site[0]
@@ -184,8 +186,8 @@ class TestSettings01ClientCodeVerify:
         assert r.status_code == 401
 
     def test_correct_code_returns_valid(self, admin_headers):
-        # A valid code equals the current user's connection password (admin123 in seed).
-        r = _api("POST", "/api/v1/settings/verify-client-code", json={"code": "admin123"}, headers=admin_headers)
+        # A valid code equals the current user's connection password (seedé, cf. ADMIN_PASSWORD).
+        r = _api("POST", "/api/v1/settings/verify-client-code", json={"code": ADMIN_PASSWORD}, headers=admin_headers)
         assert r.status_code == 200
         assert r.json().get("valid") is True
 
@@ -264,12 +266,12 @@ class TestSettings10ChangePasswordValidation:
 
     def test_change_password_rejects_short(self, admin_headers):
         r = _api("POST", "/api/v1/settings/change-password", headers=admin_headers,
-                 json={"current_password": "admin123", "new_password": "abc"})
+                 json={"current_password": ADMIN_PASSWORD, "new_password": "abc"})
         assert r.status_code == 422
 
     def test_change_password_rejects_weak(self, admin_headers):
         r = _api("POST", "/api/v1/settings/change-password", headers=admin_headers,
-                 json={"current_password": "admin123", "new_password": "abcdefg1"})
+                 json={"current_password": ADMIN_PASSWORD, "new_password": "abcdefg1"})
         assert r.status_code == 422
 
     def test_change_password_rejects_wrong_current(self, admin_headers):
@@ -282,7 +284,7 @@ def _login_user(login, password, client_code=None):
     body = {"login": login, "password": password}
     if client_code:
         body["client_code"] = client_code
-    return requests.post(f"{BASE_URL}/api/v1/auth/login", json=body)
+    return requests.post(f"{BASE_URL}/api/v1/auth/login", json=body, headers={"X-Device-Id": "pytest-device-0001"})
 
 
 @pytest.mark.v8
@@ -304,6 +306,13 @@ class TestSettings11ForcedPasswordChange:
         }
         r = _api("POST", "/api/v1/users", json=payload, headers=make_auth(token))
         assert r.status_code == 201, r.text
+        account_code = r.json().get("account_code")
+        from app.core.license_utils import generate_activation_code
+        act_code = generate_activation_code(account_code)
+        act = _api("POST", "/api/v1/auth/activate-account",
+                   json={"login": login, "activation_code": act_code},
+                   headers={"X-Device-Id": "pytest-device-0001"})
+        assert act.status_code == 200, act.text
         return login, client_code
 
     def test_forced_flag_and_self_service_change(self, admin_headers):
@@ -339,21 +348,40 @@ def _clear_access_password():
 
 @pytest.mark.v8
 class TestSettings12SupremeAdminAccess:
-    """CPS: écran Paramètres protégé par la date du jour (JJMMAAAA) comme code Supreme Admin.
+    """CPS: écran Paramètres protégé par le code Supreme Admin
+    (date du jour JJMMAAAA + suffixe fixe SUPREME_ADMIN_SECRET).
 
     Les tentatives sont journalisées dans audit_logs.
     """
 
-    def test_today_raw_date_accepted(self, admin_headers):
+    _SUPREME_SECRET = "X7K9"
+
+    def test_today_code_accepted(self, admin_headers):
         from datetime import datetime
+        today_code = datetime.now().astimezone().strftime("%d%m%Y") + self._SUPREME_SECRET
         r = _api("POST", "/api/v1/settings/verify-access",
-                 json={"password": datetime.now().astimezone().strftime("%d%m%Y")}, headers=admin_headers)
+                 json={"password": today_code}, headers=admin_headers)
         assert r.status_code == 200
         assert r.json().get("valid") is True
 
-    def test_other_day_raw_date_rejected(self, admin_headers):
+    def test_raw_date_alone_rejected(self, admin_headers):
+        # La date seule (JJMMAAAA) n'est plus un code valide.
+        from datetime import datetime
+        r = _api("POST", "/api/v1/settings/verify-access",
+                 json={"password": datetime.now().astimezone().strftime("%d%m%Y")}, headers=admin_headers)
+        assert r.status_code == 401
+
+    def test_wrong_secret_rejected(self, admin_headers):
+        # Date du jour + mauvais secret -> rejeté.
+        from datetime import datetime
+        bad_code = datetime.now().astimezone().strftime("%d%m%Y") + "AAAA"
+        r = _api("POST", "/api/v1/settings/verify-access", json={"password": bad_code}, headers=admin_headers)
+        assert r.status_code == 401
+
+    def test_other_day_code_rejected(self, admin_headers):
+        # Bon secret mais date d'un autre jour -> rejeté.
         from datetime import datetime, timedelta
-        other = (datetime.now().astimezone() + timedelta(days=1)).strftime("%d%m%Y")
+        other = (datetime.now().astimezone() + timedelta(days=1)).strftime("%d%m%Y") + self._SUPREME_SECRET
         r = _api("POST", "/api/v1/settings/verify-access", json={"password": other}, headers=admin_headers)
         assert r.status_code == 401
 
@@ -372,7 +400,7 @@ class TestSettings12SupremeAdminAccess:
         assert row is not None and row[0] == "supreme_admin_access_denied"
 
     def test_old_hmac_code_rejected(self, admin_headers):
-        # L'ancien code HMAC à 6 chiffres n'est plus accepté : seule la date brute compte.
+        # L'ancien code HMAC à 6 chiffres n'est plus accepté.
         r = _api("POST", "/api/v1/settings/verify-access", json={"password": "783897"}, headers=admin_headers)
         assert r.status_code == 401
 
@@ -434,17 +462,17 @@ class TestSettings13LicenseReductionBlocked:
 class TestSettings14DedicatedAccessPassword:
     """CPS: dès qu'un mot de passe d'accès dédié est défini
     (settings_access_hash), verify-access doit le vérifier (argon2, temps
-    constant) ; sinon repli sur le code JJMMAAAA du jour."""
+    constant) ; sinon repli sur le code Supreme Admin (JJMMAAAA + suffixe secret)."""
 
     def test_dedicated_password_is_enforced(self, admin_headers):
         from datetime import datetime
         _clear_access_password()
         try:
-            today = datetime.now().astimezone().strftime("%d%m%Y")
+            today_code = datetime.now().astimezone().strftime("%d%m%Y") + "X7K9"
             new_password = "Param@2026x"
 
             r = _api("POST", "/api/v1/settings/change-access-password",
-                     json={"current_password": today, "new_password": new_password},
+                     json={"current_password": today_code, "new_password": new_password},
                      headers=admin_headers)
             assert r.status_code == 200, r.text
 
@@ -458,7 +486,7 @@ class TestSettings14DedicatedAccessPassword:
             assert bad.status_code == 401
 
             date_rejected = _api("POST", "/api/v1/settings/verify-access",
-                                 json={"password": today}, headers=admin_headers)
+                                 json={"password": today_code}, headers=admin_headers)
             assert date_rejected.status_code == 401
         finally:
             _clear_access_password()

@@ -1,5 +1,7 @@
 import os
 from functools import lru_cache
+
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -28,6 +30,10 @@ class Settings(BaseSettings):
     # Dossier contenant le frontend compilé (servi par le backend en mode production Web).
     UI_DIST_PATH: str = ""
 
+    # Suffixe secret du code d'accès Admin suprême (JJMMAAAA + ce suffixe).
+    # Aucune valeur par défaut : le serveur refuse de démarrer si elle est
+    # absente/vide (fail-fast, validator _supreme_admin_secret_required).
+    # Ne jamais committer la vraie valeur — elle n'existe que dans le .env.
     SUPREME_ADMIN_SECRET: str = ""
 
     # Fuseau horaire de l'application (vide = heure locale du serveur).
@@ -37,6 +43,31 @@ class Settings(BaseSettings):
     # à celui de l'outil de référence Python et de l'app Android).
     # Charge uniquement depuis .env (jamais une valeur en dur dans le code).
     LICENSE_SECRET: str = ""
+
+    @field_validator("JWT_SECRET_KEY")
+    @classmethod
+    def _jwt_secret_required(cls, v: str) -> str:
+        # Pas de valeur par défaut silencieuse pour un secret de signature :
+        # un secret vide (ou absent) ferait des tokens forgeables. Fail-fast.
+        if not v.strip():
+            raise ValueError(
+                "JWT_SECRET_KEY n'est pas défini : impossible de signer les tokens "
+                "d'authentification (faille de sécurité majeure). Générez une valeur "
+                "forte (ex. `openssl rand -hex 32`), définissez-la dans .env, et ne "
+                "la committez jamais."
+            )
+        return v
+
+    @field_validator("SUPREME_ADMIN_SECRET")
+    @classmethod
+    def _supreme_admin_secret_required(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError(
+                "SUPREME_ADMIN_SECRET n'est pas défini : le code d'accès Admin suprême "
+                "vaut JJMMAAAA + ce suffixe secret. Définissez-le dans .env "
+                "(ex. X7K9, à rallonger en production)."
+            )
+        return v
 
     class Config:
         env_file = ".env"

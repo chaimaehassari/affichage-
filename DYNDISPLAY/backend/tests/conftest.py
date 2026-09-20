@@ -3,10 +3,13 @@ import psycopg
 import pytest
 import requests
 
+from tests._test_config import get_test_db_url, get_test_admin_password
+
 BASE_URL = "http://localhost:8000"
-DB_URL = "postgresql://postgres:chaimae@127.0.0.1:5433/DYNDISPLAY"
+DB_URL = get_test_db_url()
 ADMIN_LOGIN = "admin"
-ADMIN_PASSWORD = "admin123"
+ADMIN_PASSWORD = get_test_admin_password()
+TEST_DEVICE = "pytest-device-0001"
 
 
 # ---------------------------------------------------------------------------
@@ -28,10 +31,22 @@ def _unlock_admin():
 # Helpers
 # ---------------------------------------------------------------------------
 
-def login_as(login_str: str, password_str: str) -> str | None:
+def login_as(
+    login_str: str,
+    password_str: str,
+    client_code: str | None = None,
+    device_id: str | None = TEST_DEVICE,
+) -> str | None:
+    body = {"login": login_str, "password": password_str}
+    if client_code:
+        body["client_code"] = client_code
+    headers = {}
+    if device_id:
+        headers["X-Device-Id"] = device_id
     resp = requests.post(
         f"{BASE_URL}/api/v1/auth/login",
-        json={"login": login_str, "password": password_str},
+        json=body,
+        headers=headers,
     )
     if resp.status_code == 200:
         return resp.json().get("access_token")
@@ -39,7 +54,31 @@ def login_as(login_str: str, password_str: str) -> str | None:
 
 
 def make_headers(token: str) -> dict:
-    return {"Authorization": f"Bearer {token}"}
+    return {"Authorization": f"Bearer {token}", "X-Device-Id": TEST_DEVICE}
+
+
+def generate_activation_code_for(account_code: str) -> str:
+    from app.core.license_utils import generate_activation_code
+
+    return generate_activation_code(account_code)
+
+
+def activate_device_account(
+    login: str,
+    account_code: str,
+    device_id: str = TEST_DEVICE,
+) -> requests.Response:
+    """Active un compte par appareil (équivalent de l'application mobile).
+
+    Génère le code d'activation (même secret HMAC que le backend) puis
+    l'échange contre POST /auth/activate-account.
+    """
+    code = generate_activation_code_for(account_code)
+    return requests.post(
+        f"{BASE_URL}/api/v1/auth/activate-account",
+        json={"login": login, "activation_code": code},
+        headers={"X-Device-Id": device_id},
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,10 @@
-"""Seed an initial admin user into the database."""
+"""Seed an initial admin user into the database.
+
+Le mot de passe du compte admin n'est JAMAIS en dur : il est lu depuis la
+variable d'environnement SEED_ADMIN_PASSWORD (réservée au dev/tests) ou,
+à défaut, généré aléatoirement et affiché UNE SEULE FOIS, à la création.
+"""
+import secrets
 import sys
 import os
 
@@ -8,7 +14,12 @@ from app.core.security import hash_password, verify_password
 from app.db.database import get_connection
 
 
+def _bootstrap_password() -> str:
+    return os.environ.get("SEED_ADMIN_PASSWORD") or secrets.token_urlsafe(18)
+
+
 def seed():
+    password = _bootstrap_password()
     with get_connection() as conn:
         try:
             # Create admin profile if it doesn't exist
@@ -66,16 +77,22 @@ def seed():
             if not admin_user:
                 admin_user = conn.execute(
                     """
-                    INSERT INTO users (profile_id, login, password_hash, is_active, must_change_password)
-                    VALUES (%s, 'admin', %s, TRUE, FALSE)
+                    INSERT INTO users (profile_id, login, password_hash, is_active, must_change_password, is_superadmin, requires_activation, client_id)
+                    VALUES (%s, 'admin', %s, TRUE, FALSE, TRUE, FALSE, (SELECT id FROM clients ORDER BY id LIMIT 1))
                     RETURNING user_id
                     """,
-                    (admin_profile["profile_id"], hash_password("admin123")),
+                    (admin_profile["profile_id"], hash_password(password)),
                 ).fetchone()
                 print(f"Created admin user: admin (id={admin_user['user_id']})")
-                print("  password: admin123")
+                print(f"  password: {password}  <-- à conserver EN UN SEUL exemplaire")
+                print("  (ouverture de session : admin / mot de passe ci-dessus)")
             else:
-                print(f"Admin user already exists (id={admin_user['user_id']})")
+                # S'assurer que le compte admin par défaut est le Super Admin
+                conn.execute(
+                    "UPDATE users SET is_superadmin = TRUE, requires_activation = FALSE WHERE user_id = %s",
+                    (admin_user["user_id"],),
+                )
+                print(f"Admin user already exists (id={admin_user['user_id']}) ; mot de passe non modifié")
 
             conn.commit()
             print("\nSeed completed successfully.")

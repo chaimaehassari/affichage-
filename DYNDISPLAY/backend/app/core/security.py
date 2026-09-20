@@ -1,5 +1,5 @@
+import secrets
 from datetime import datetime, timedelta, timezone
-import hmac
 
 import jwt
 from argon2 import PasswordHasher
@@ -51,18 +51,20 @@ def decode_access_token(token: str) -> dict | None:
 
 
 def verify_supreme_admin_code(code: str, username: str | None = None) -> bool:
-    """Vérifie le code admin suprême.
+    """Vérifie le code d'accès Admin suprême.
 
-    Le seul mécanisme valide est le code JJMMAAAA (date brute du jour dans le
-    fuseau de l'application, ex. 03092026). Aucun code HMAC n'est généré :
-    l'opérateur saisit simplement la date du jour.
+    Le code attendu est la date du jour au format JJMMAAAA (fuseau de
+    l'application, ex. 17092026 pour le 17/09/2026) suivie du suffixe fixe
+    SUPREME_ADMIN_SECRET (ex. 17092026X7K9). Le suffixe secret rend le code
+    non devinable à partir de la seule connaissance de la date du jour.
+    Comparaison à temps constant via secrets.compare_digest.
     """
-    # Le nom d'utilisateur (nom/le login) n'est jamais un code valide.
+    # Le nom d'utilisateur (login) n'est jamais un code valide.
     if username and code.strip().lower() == username.strip().lower():
         return False
     stripped = code.strip()
 
-    # Date brute du jour au format JJMMAAAA dans le fuseau de l'application
+    # Date du jour au format JJMMAAAA dans le fuseau de l'application
     # (heure locale du serveur, ou fuseau configuré via APP_TIMEZONE).
-    today_raw = now_app().strftime("%d%m%Y")
-    return hmac.compare_digest(stripped, today_raw)
+    expected_code = now_app().strftime("%d%m%Y") + settings.SUPREME_ADMIN_SECRET
+    return secrets.compare_digest(stripped, expected_code)

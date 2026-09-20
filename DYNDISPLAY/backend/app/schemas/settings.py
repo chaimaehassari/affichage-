@@ -143,3 +143,33 @@ class FtpTestRequest(BaseModel):
 class FtpTestResult(BaseModel):
     success: bool
     message: str
+
+
+class AccountDeviceOut(BaseModel):
+    user_id: int
+    login: str
+    user_code: str | None = None
+    profile_name: str
+    is_superadmin: bool = False
+    account_code: str | None = None
+    requires_activation: bool = False
+    authorized_device_id: str | None = None
+    activated_at: str | None = None
+    created_at: str | None = None
+
+
+class AccountDeviceListResponse(BaseModel):
+    accounts: list[AccountDeviceOut]
+    total: int
+    license_posts: int
+    activated_accounts: int
+    available_slots: int
+
+
+class RevokeDeviceRequest(BaseModel):
+    pass
+
+
+class RevokeDeviceResponse(BaseModel):
+    success: bool
+    message: str

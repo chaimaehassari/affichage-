@@ -48,7 +48,17 @@ export default function BatchAssign() {
   const loadComposition = useCallback(async (groupId) => {
     setCompositionLoading(true);
     const res = await getGroupComposition(groupId);
-    if (res.ok && res.data) setComposition(res.data);
+    if (res.ok && res.data) {
+      setComposition(res.data);
+    } else if (res.status === 403) {
+      setComposition(null);
+      setSelectedGroupId(null);
+      const fres = await getGroups();
+      if (fres.ok) setGroups(fres.data);
+      showNotif('error', "Accès refusé à ce groupe d'écrans : il ne vous est pas assigné.");
+    } else {
+      setComposition(null);
+    }
     setCompositionLoading(false);
   }, []);
 

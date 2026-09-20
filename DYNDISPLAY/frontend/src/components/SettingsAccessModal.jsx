@@ -43,17 +43,17 @@ export default function SettingsAccessModal({ onSuccess, onCancel, expired }) {
             <input
               type="password"
               value={password}
-              onChange={e => { setPassword(e.target.value.replace(/\D/g, '').slice(0, 8)); setError(''); }}
+              onChange={e => { setPassword(e.target.value); setError(''); }}
               autoFocus
-              maxLength={8}
-              pattern="[0-9]{8}"
+              maxLength={64}
+              autoComplete="off"
               className="w-full pl-10 pr-4 py-2.5 bg-[#0f1217] border border-white/10 rounded-lg text-white text-sm tracking-[0.3em] text-center font-mono focus:outline-none focus:border-[#f6c200]/50 transition-colors"
             />
           </div>
           {error && <p className="text-red-400 text-xs">{error}</p>}
           <div className="flex gap-3 justify-end">
             <button type="button" onClick={onCancel} className="px-4 py-2 bg-[#2a2f36] text-white/80 text-sm rounded-lg hover:bg-[#3a3646] border border-white/5">Annuler</button>
-            <button type="submit" disabled={password.length !== 8 || loading} className="px-4 py-2 text-sm font-semibold rounded-lg disabled:opacity-50" style={{ background: 'linear-gradient(135deg, #f6c200, #ffdb4d)' }}>
+            <button type="submit" disabled={password.trim().length === 0 || loading} className="px-4 py-2 text-sm font-semibold rounded-lg disabled:opacity-50" style={{ background: 'linear-gradient(135deg, #f6c200, #ffdb4d)' }}>
               <span className="text-[#111418]">{loading ? 'Vérification...' : 'Valider'}</span>
             </button>
           </div>

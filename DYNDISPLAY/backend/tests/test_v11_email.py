@@ -70,9 +70,32 @@ class TestUserEmail:
     # EMAIL-03: /auth/me exposes email after login
     def test_email03_me_exposes_email(self, admin_headers):
         email = f"{_uid().lower()}@example.com"
-        login = self._create_user_with_email(admin_headers, email=email, suffix="003")
+        login = f"emailuser_{_uid()}_003"
+        payload = {
+            "user_code": f"EC{_uid()}",
+            "login": login,
+            "password": TEST_PASSWORD,
+            "password_confirm": TEST_PASSWORD,
+            "profile_id": 2,
+            "is_active": True,
+            "zones": [1, 2],
+            "permissions": [],
+            "email": email,
+        }
+        r = _api("POST", "/api/v1/users", json=payload, headers=admin_headers)
+        assert r.status_code == 201, r.text
+        account_code = r.json().get("account_code")
         u = self._find_user(admin_headers, login)
-        r = _api("POST", "/api/v1/auth/login", json={"login": login, "password": TEST_PASSWORD, "client_code": u["user_code"]})
+
+        from app.core.license_utils import generate_activation_code
+        act_code = generate_activation_code(account_code)
+        act = _api("POST", "/api/v1/auth/activate-account",
+                   json={"login": login, "activation_code": act_code},
+                   headers={"X-Device-Id": "pytest-device-0001"})
+        assert act.status_code == 200, act.text
+
+        r = _api("POST", "/api/v1/auth/login", json={"login": login, "password": TEST_PASSWORD, "client_code": u["user_code"]},
+                 headers={"X-Device-Id": "pytest-device-0001"})
         assert r.status_code == 200
         assert r.json()["user"].get("email") == email.lower()
 

@@ -1,3 +1,5 @@
+import { getDeviceId } from '../utils/deviceId';
+
 function detectBaseUrl() {
   const envBase = import.meta.env.VITE_API_BASE_URL;
   if (envBase) return envBase.replace(/\/+$/, '');
@@ -35,7 +37,15 @@ class ApiService {
   }
 
   mediaUrl(sftpPath) {
-    return `${this.baseUrl}/media/${sftpPath}`;
+    return this.withMediaToken(`${this.baseUrl}/media/${sftpPath}`);
+  }
+
+  withMediaToken(url) {
+    if (!url) return url;
+    const token = this.getToken();
+    if (!token) return url;
+    const sep = url.includes('?') ? '&' : '?';
+    return `${url}${sep}token=${encodeURIComponent(token)}`;
   }
 
   async request(endpoint, options = {}) {
@@ -44,6 +54,7 @@ class ApiService {
 
     const headers = {
       'Content-Type': 'application/json',
+      'X-Device-Id': getDeviceId(),
       ...options.headers,
     };
 

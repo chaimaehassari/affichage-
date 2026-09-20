@@ -5,7 +5,7 @@ import { LogOut, ArrowLeft, Monitor, LayoutGrid } from 'lucide-react';
 import ThemeToggle from '../components/ThemeToggle';
 import NavBar from '../components/NavBar';
 import { getPostConfig } from '../services/display';
-import { extractDetailMessage } from '../services/api';
+import apiService, { extractDetailMessage } from '../services/api';
 
 function PdfZone({ media, className, style }) {
   const pages = media?.pdf_pages || [];
@@ -35,7 +35,7 @@ function PdfZone({ media, className, style }) {
       {pages.map((url, i) => (
         <img
           key={`${media.media_id}-p${i}`}
-          src={url}
+          src={apiService.withMediaToken(url)}
           alt={`${media.name} page ${i + 1}`}
           className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-500 ${i === currentPage ? 'opacity-100' : 'opacity-0'}`}
           onError={(e) => { e.target.style.display = 'none'; }}
@@ -87,7 +87,7 @@ function ZoneSlideshow({ playlist, zoneNumber, zoneStyle, color }) {
   }
 
   const media = validItems[currentIndex % validItems.length];
-  const mediaUrl = media.url || null;
+  const mediaUrl = media.url ? apiService.withMediaToken(media.url) : null;
 
   return (
     <div className="absolute border border-white/20" style={zoneStyle}>

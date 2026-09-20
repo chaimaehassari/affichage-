@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { LogOut, ArrowLeft, Plus, Pencil, Trash2, Eye } from 'lucide-react';
+import { LogOut, ArrowLeft, Plus, Pencil, Trash2, Eye, Search } from 'lucide-react';
 import ThemeToggle from '../components/ThemeToggle';
 import NavBar from '../components/NavBar';
 import { getSites, createSite, updateSite, deleteSite, getPosts, createPost, updatePost, deletePost } from '../services/sites';
@@ -27,6 +27,21 @@ export default function SitesPosts() {
   const [siteForm, setSiteForm] = useState({ code: '', name: '', address: '', description: '', is_active: true });
   const [postForm, setPostForm] = useState({ code: '', name: '', player_type: 'Windows', ip_address: '', is_active: true, site_id: '' });
   const [saving, setSaving] = useState(false);
+
+  const [siteSearch, setSiteSearch] = useState('');
+  const [postSearch, setPostSearch] = useState('');
+
+  const filteredSites = sites.filter(s => {
+    const t = siteSearch.trim().toLowerCase();
+    if (!t) return true;
+    return (`${s.code} ${s.name}`).toLowerCase().includes(t);
+  });
+
+  const filteredPosts = posts.filter(p => {
+    const t = postSearch.trim().toLowerCase();
+    if (!t) return true;
+    return (`${p.code} ${p.name}`).toLowerCase().includes(t);
+  });
 
   const fetchSites = useCallback(async () => {
     const result = await getSites();
@@ -335,12 +350,18 @@ export default function SitesPosts() {
                     </button>
                   )}
                 </div>
+                <div className="relative mb-3">
+                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[#a0a7b3]" />
+                  <input type="text" value={siteSearch} onChange={(e) => setSiteSearch(e.target.value)}
+                    placeholder="Rechercher un site..."
+                    className="w-full bg-[#1a1f24] text-white placeholder-[#a0a7b3] pl-10 pr-4 py-2 rounded-lg border border-white/10 text-sm focus:outline-none focus:border-[#f6c200]/50" />
+                </div>
                 <div className="bg-[#111418]/80 border border-white/10 rounded-lg overflow-hidden">
                   <div className="max-h-[55vh] overflow-y-auto">
-                    {sites.length === 0 ? (
-                      <p className="px-4 py-6 text-center text-[#a0a7b3] text-sm">Aucun site.</p>
+                    {filteredSites.length === 0 ? (
+                      <p className="px-4 py-6 text-center text-[#a0a7b3] text-sm">{siteSearch ? 'Aucun site trouvé.' : 'Aucun site.'}</p>
                     ) : (
-                      sites.map(s => (
+                      filteredSites.map(s => (
                         <div key={s.site_id}
                           onClick={() => setSelectedSite(s)}
                           className={`flex items-center justify-between px-4 py-3 cursor-pointer border-b border-white/5 transition-colors ${selectedSite?.site_id === s.site_id ? 'bg-[#f6c200]/10 border-l-2 border-l-[#f6c200]' : 'hover:bg-white/[0.02]'}`}>
@@ -379,11 +400,17 @@ export default function SitesPosts() {
                     </button>
                   )}
                 </div>
+                <div className="relative mb-3">
+                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[#a0a7b3]" />
+                  <input type="text" value={postSearch} onChange={(e) => setPostSearch(e.target.value)}
+                    placeholder="Rechercher un poste..."
+                    className="w-full bg-[#1a1f24] text-white placeholder-[#a0a7b3] pl-10 pr-4 py-2 rounded-lg border border-white/10 text-sm focus:outline-none focus:border-[#f6c200]/50" />
+                </div>
                 <div className="bg-[#111418]/80 border border-white/10 rounded-lg overflow-hidden">
                   {!selectedSite ? (
                     <p className="px-4 py-8 text-center text-[#a0a7b3] text-sm">Sélectionnez un site pour voir ses postes.</p>
-                  ) : posts.length === 0 ? (
-                    <p className="px-4 py-8 text-center text-[#a0a7b3] text-sm">Aucun poste pour ce site.</p>
+                  ) : filteredPosts.length === 0 ? (
+                    <p className="px-4 py-8 text-center text-[#a0a7b3] text-sm">{postSearch ? 'Aucun poste trouvé.' : 'Aucun poste pour ce site.'}</p>
                   ) : (
                     <table className="w-full">
                       <thead>
@@ -397,7 +424,7 @@ export default function SitesPosts() {
                         </tr>
                       </thead>
                       <tbody>
-                        {posts.map(p => (
+                        {filteredPosts.map(p => (
                           <tr key={p.post_id} className="border-b border-white/5 hover:bg-white/[0.02] transition-colors">
                             <td className="px-4 py-3 text-sm text-white">{p.code}</td>
                             <td className="px-4 py-3 text-sm text-[#a0a7b3]">{p.name}</td>

@@ -3,12 +3,13 @@ from psycopg import Connection
 from datetime import datetime, timezone
 
 from app.db.database import get_db
-from app.dependencies.auth import get_current_user_dependency, require_permission
+from app.dependencies.auth import get_current_user_dependency, require_permission, require_superadmin
 from app.core.security import verify_password, hash_password, verify_supreme_admin_code
 from app.schemas.settings import (
     SettingsOut, SettingsUpdate, ClientCodeVerify, ChangePasswordRequest,
     LicenseUpdateRequest, AccessPasswordVerify, ChangeAccessPasswordRequest,
     FtpProfileCreate, FtpProfileUpdate, FtpProfileOut, FtpTestRequest, FtpTestResult,
+    AccountDeviceOut, AccountDeviceListResponse, RevokeDeviceResponse,
 )
 from app.services.settings_service import SettingsService, FtpProfileService
 from app.services.user_service import UserService
@@ -237,3 +238,50 @@ def test_ftp(
 ):
     service = FtpProfileService(db)
     return service.test_connection(payload.profile_id)
+
+
+# --- Activation par compte / appareils (réservé au Super Admin) ---
+
+
+@router.get("/settings/accounts/devices", response_model=AccountDeviceListResponse)
+def list_account_devices(
+    current_user=Depends(require_superadmin),
+    db: Connection = Depends(get_db),
+):
+    service = SettingsService(db)
+    accounts = service.list_account_devices()
+    license_posts = service.get_license_posts()
+    activated = service.count_activated_accounts()
+    return AccountDeviceListResponse(
+        accounts=[AccountDeviceOut(**a) for a in accounts],
+        total=len(accounts),
+        license_posts=license_posts,
+        activated_accounts=activated,
+        available_slots=max(license_posts - activated, 0),
+    )
+
+
+@router.post("/settings/accounts/{user_id}/revoke-device", response_model=RevokeDeviceResponse)
+def revoke_account_device(
+    user_id: int,
+    current_user=Depends(require_superadmin),
+    db: Connection = Depends(get_db),
+):
+    if user_id == current_user.user_id:
+        raise HTTPException(status_code=400, detail="Impossible de libérer votre propre appareil.")
+
+    from app.services.audit_service import log_action
+    service = SettingsService(db)
+    try:
+        result = service.revoke_device(user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if result is None:
+        raise HTTPException(status_code=404, detail="Utilisateur introuvable.")
+
+    log_action(db, current_user.user_id, "device_revoke", "user", user_id,
+               f"Appareil libéré pour le compte {user_id}")
+    return RevokeDeviceResponse(
+        success=True,
+        message="Appareil libéré. Le prochain appareil qui se connectera avec ce compte sera automatiquement autorisé.",
+    )

@@ -69,6 +69,15 @@ def _create_user(admin_headers, perm_map, codes=(), zones=(), view=True):
     }
     r = _api("POST", "/api/v1/users", json=payload, headers=admin_headers)
     assert r.status_code == 201, r.text
+    account_code = r.json().get("account_code")
+
+    from app.core.license_utils import generate_activation_code
+    act_code = generate_activation_code(account_code)
+    act = _api("POST", "/api/v1/auth/activate-account",
+               json={"login": login, "activation_code": act_code},
+               headers={"X-Device-Id": "pytest-device-0001"})
+    assert act.status_code == 200, act.text
+
     _USER_CODES[login] = client_code
     return login
 
@@ -87,7 +96,7 @@ def _token(login, password="Test@1234"):
     body = {"login": login, "password": password}
     if login in _USER_CODES:
         body["client_code"] = _USER_CODES[login]
-    r = _api("POST", "/api/v1/auth/login", json=body)
+    r = _api("POST", "/api/v1/auth/login", json=body, headers={"X-Device-Id": "pytest-device-0001"})
     assert r.status_code == 200, r.text
     return r.json()["access_token"]
 
@@ -163,18 +172,38 @@ class TestPermissions:
             assert r.status_code == 403, f"{path} -> {r.status_code} {r.text}"
         _delete_user(admin_headers, login)
 
-    def test_zone_scope_enforced(self, admin_headers, perm_map, site_post):
+    def test_zone_scope_enforced(self, admin_headers, perm_map):
         login = _create_user(admin_headers, perm_map, codes=("menu_config",), zones=(3, 4))
+        client_code = _USER_CODES.get(login)
         h = {"Authorization": f"Bearer {_token(login)}"}
-        r = _api("POST", f"/api/v1/posts/{site_post}/zones", headers=h, json=[
-            {"zone_number": 1, "media_id": None},
-        ])
-        assert r.status_code == 403, r.text
-        r2 = _api("POST", f"/api/v1/posts/{site_post}/zones", headers=h, json=[
-            {"zone_number": 3, "media_id": None},
-        ])
-        assert r2.status_code == 200, r2.text
-        _delete_user(admin_headers, login)
+        # Poste dédié rattaché au périmètre du client de l'utilisateur :
+        # le scoping multi-tenant exige que les zones soient configurées sur
+        # un poste appartenant au client de l'utilisateur.
+        r_site = _api("POST", "/api/v1/sites", headers=admin_headers, json={
+            "code": f"ZS_{_uid()}", "name": "Zone scope site", "is_active": True,
+            "client_code": client_code,
+        })
+        assert r_site.status_code == 201, r_site.text
+        site_id = r_site.json()["site_id"]
+        r_post = _api("POST", "/api/v1/posts", headers=admin_headers, json={
+            "site_id": site_id, "code": f"ZP_{_uid()}", "name": "Zone scope post",
+            "player_type": "Windows", "is_active": True,
+        })
+        assert r_post.status_code == 201, r_post.text
+        post_id = r_post.json()["post_id"]
+        try:
+            r = _api("POST", f"/api/v1/posts/{post_id}/zones", headers=h, json=[
+                {"zone_number": 1, "media_id": None},
+            ])
+            assert r.status_code == 403, r.text
+            r2 = _api("POST", f"/api/v1/posts/{post_id}/zones", headers=h, json=[
+                {"zone_number": 3, "media_id": None},
+            ])
+            assert r2.status_code == 200, r2.text
+        finally:
+            _api("DELETE", f"/api/v1/posts/{post_id}", headers=admin_headers)
+            _api("DELETE", f"/api/v1/sites/{site_id}", headers=admin_headers)
+            _delete_user(admin_headers, login)
 
     def test_me_contains_zones_and_permissions(self, admin_headers, perm_map):
         login = _create_user(admin_headers, perm_map, codes=("user_list", "menu_config"),

@@ -27,11 +27,15 @@ SITE_POST_PERMISSIONS = [
     {"permission_id": 20, "can_delete": True, "can_view": True},  # delete_post
 ]
 
+SUPER_PERMISSIONS = SITE_POST_PERMISSIONS + [
+    {"permission_id": 12, "can_view": True},   # menu_config (Supervision)
+]
+
 
 @pytest.mark.v14
 class TestClientScope:
 
-    def _create_client(self, admin_headers, requires_activation=True):
+    def _create_client(self, admin_headers, requires_activation=True, permissions=None):
         user_code = f"SCO{_uid()}"
         login = f"cliscope_{_uid()}"
         payload = {
@@ -43,10 +47,17 @@ class TestClientScope:
             "is_active": True,
             "requires_activation": requires_activation,
             "zones": [],
-            "permissions": SITE_POST_PERMISSIONS,
+            "permissions": permissions if permissions is not None else SITE_POST_PERMISSIONS,
         }
         r = _api("POST", "/api/v1/users", json=payload, headers=admin_headers)
         assert r.status_code == 201, r.text
+        account_code = r.json().get("account_code")
+        from app.core.license_utils import generate_activation_code
+        act_code = generate_activation_code(account_code)
+        act = _api("POST", "/api/v1/auth/activate-account",
+                   json={"login": login, "activation_code": act_code},
+                   headers={"X-Device-Id": "pytest-device-0001"})
+        assert act.status_code == 200, act.text
         return {"user_code": user_code, "login": login}
 
     def _find_user(self, admin_headers, login):
@@ -62,7 +73,7 @@ class TestClientScope:
     def _login(self, login, user_code):
         r = _api("POST", "/api/v1/auth/login", json={
             "login": login, "password": TEST_PASSWORD, "client_code": user_code,
-        })
+        }, headers={"X-Device-Id": "pytest-device-0001"})
         assert r.status_code == 200, r.text
         return r.json()
 
@@ -72,8 +83,8 @@ class TestClientScope:
         r = _api("POST", "/api/v1/auth/activate", json={"code": code}, headers=headers)
         assert r.status_code == 200, r.text
 
-    def _client_headers(self, admin_headers):
-        c = self._create_client(admin_headers, requires_activation=True)
+    def _client_headers(self, admin_headers, permissions=None):
+        c = self._create_client(admin_headers, requires_activation=True, permissions=permissions)
         u = self._find_user(admin_headers, c["login"])
         session = self._login(c["login"], c["user_code"])
         headers = {"Authorization": f"Bearer {session['access_token']}"}
@@ -96,6 +107,27 @@ class TestClientScope:
         }, headers=headers)
         assert r.status_code == 201, r.text
         return r.json()
+
+    def _assign_group(self, admin_headers, user_id, groups):
+        ud = _api("GET", f"/api/v1/users/{user_id}", headers=admin_headers).json()
+        payload = {
+            "user_code": ud.get("user_code") or "",
+            "login": ud["login"],
+            "email": ud.get("email") or "",
+            "profile_id": ud["profile_id"],
+            "is_active": ud["is_active"],
+            "requires_activation": ud.get("is_activated") is False,
+            "zones": [z["zone_number"] for z in ud.get("zones", []) if z.get("is_allowed")],
+            "groups": groups,
+            "permissions": [
+                {"permission_id": p["permission_id"], "can_view": p["can_view"],
+                 "can_create": p["can_create"], "can_update": p["can_update"],
+                 "can_delete": p["can_delete"]}
+                for p in ud.get("permissions", [])
+            ],
+        }
+        r = _api("PUT", f"/api/v1/users/{user_id}", json=payload, headers=admin_headers)
+        assert r.status_code == 200, r.text
 
     # SCO-01: l'admin voit tous les sites ; chaque client ne voit que les sites de son n° client
     def test_sco01_admin_sees_all_clients_scoped(self, admin_headers):
@@ -205,6 +237,10 @@ class TestClientScope:
                 "post_ids": [post_a["post_id"], post_b["post_id"]],
             }, headers=admin_headers)
 
+            # Le groupe doit être assigné aux clients pour qu'ils puissent y accéder
+            self._assign_group(admin_headers, a["user"]["user_id"], [gid])
+            self._assign_group(admin_headers, b["user"]["user_id"], [gid])
+
             # Client A ne voit dans la composition que son site et son poste ; le groupe ne compte qu'1 poste pour lui
             comp = _api("GET", f"/api/v1/groups/{gid}/composition", headers=a["headers"]).json()
             assert comp["post_count"] == 1
@@ -234,3 +270,154 @@ class TestClientScope:
             assert s_other["site_id"] not in [x["site_id"] for x in r.json()]
         finally:
             self._delete_user(admin_headers, a["user"]["user_id"])
+
+    # SCO-06: accès aux groupes par utilisateur — seul l'admin voit tout ;
+    # un client ne voit que les groupes assignés et reçoit 403 pour les autres
+    def test_sco06_groups_per_user_access(self, admin_headers):
+        a = self._client_headers(admin_headers)
+        b = self._client_headers(admin_headers)
+        try:
+            g1 = _api("POST", "/api/v1/groups", json={
+                "name": f"GA{_uid()}", "description": "", "is_active": True,
+            }, headers=admin_headers).json()["group_id"]
+            g2 = _api("POST", "/api/v1/groups", json={
+                "name": f"GB{_uid()}", "description": "", "is_active": True,
+            }, headers=admin_headers).json()["group_id"]
+
+            # L'admin voit les deux groupes
+            admin_groups = _api("GET", "/api/v1/groups", headers=admin_headers).json()
+            assert {g["group_id"] for g in admin_groups} >= {g1, g2}
+
+            # Sans assignation, le client A ne voit aucun groupe
+            groups_a = _api("GET", "/api/v1/groups", headers=a["headers"]).json()
+            assert groups_a == []
+
+            # Accès au détail d'un groupe non assigné -> 403
+            r = _api("GET", f"/api/v1/groups/{g1}", headers=a["headers"])
+            assert r.status_code == 403
+            r = _api("GET", f"/api/v1/groups/{g1}/composition", headers=a["headers"])
+            assert r.status_code == 403
+
+            # On assigne g1 au client A : il le voit, mais pas g2
+            self._assign_group(admin_headers, a["user"]["user_id"], [g1])
+            groups_a = _api("GET", "/api/v1/groups", headers=a["headers"]).json()
+            assert [g["group_id"] for g in groups_a] == [g1]
+            r = _api("GET", f"/api/v1/groups/{g2}/composition", headers=a["headers"])
+            assert r.status_code == 403
+
+            # Le client B (non assigné) reçoit aussi 403
+            r = _api("GET", f"/api/v1/groups/{g1}/composition", headers=b["headers"])
+            assert r.status_code == 403
+        finally:
+            for c in (a, b):
+                self._delete_user(admin_headers, c["user"]["user_id"])
+
+    # SCO-07: retirer un groupe d'un utilisateur le rend inacessible
+    def test_sco07_revoke_group(self, admin_headers):
+        a = self._client_headers(admin_headers)
+        try:
+            g1 = _api("POST", "/api/v1/groups", json={
+                "name": f"GR{_uid()}", "description": "", "is_active": True,
+            }, headers=admin_headers).json()["group_id"]
+            self._assign_group(admin_headers, a["user"]["user_id"], [g1])
+            groups_a = _api("GET", "/api/v1/groups", headers=a["headers"]).json()
+            assert [g["group_id"] for g in groups_a] == [g1]
+
+            self._assign_group(admin_headers, a["user"]["user_id"], [])
+            groups_a = _api("GET", "/api/v1/groups", headers=a["headers"]).json()
+            assert groups_a == []
+            r = _api("GET", f"/api/v1/groups/{g1}", headers=a["headers"])
+            assert r.status_code == 403
+        finally:
+            self._delete_user(admin_headers, a["user"]["user_id"])
+
+    # SCO-08: un client non-admin qui crée un groupe le voit immédiatement
+    # (auto-assignation du groupe au créateur)
+    def test_sco08_group_creation_auto_assigned(self, admin_headers):
+        a = self._client_headers(admin_headers)
+        try:
+            r = _api("POST", "/api/v1/groups", json={
+                "name": f"GC{_uid()}", "description": "", "is_active": True,
+            }, headers=a["headers"])
+            assert r.status_code == 201, r.text
+            gid = r.json()["group_id"]
+
+            # Le créateur voit son groupe et peut lire sa composition sans 403
+            groups_a = _api("GET", "/api/v1/groups", headers=a["headers"]).json()
+            assert [g["group_id"] for g in groups_a] == [gid]
+            comp = _api("GET", f"/api/v1/groups/{gid}/composition", headers=a["headers"])
+            assert comp.status_code == 200
+        finally:
+            self._delete_user(admin_headers, a["user"]["user_id"])
+
+    # SCO-09: la supervision est limitée au périmètre client (client_code)
+    def test_sco09_supervision_scoped_by_client(self, admin_headers):
+        a = self._client_headers(admin_headers, permissions=SUPER_PERMISSIONS)
+        b = self._client_headers(admin_headers, permissions=SUPER_PERMISSIONS)
+        try:
+            s_a = self._create_site(admin_headers, f"VSA{_uid()}", a["client"]["user_code"])
+            s_b = self._create_site(admin_headers, f"VSB{_uid()}", b["client"]["user_code"])
+            post_a = self._create_post(a["headers"], s_a["site_id"], f"VPA{_uid()}")
+            post_b = self._create_post(b["headers"], s_b["site_id"], f"VPB{_uid()}")
+
+            # L'admin voit les deux postes
+            sup_admin = _api("GET", "/api/v1/supervision", headers=admin_headers).json()
+            admin_posts = {p["post_id"] for s in sup_admin for p in s["posts"]}
+            assert post_a["post_id"] in admin_posts and post_b["post_id"] in admin_posts
+
+            # Le client A ne voit que son site et son poste
+            sup_a = _api("GET", "/api/v1/supervision", headers=a["headers"]).json()
+            assert sup_a
+            a_posts = {p["post_id"] for s in sup_a for p in s["posts"]}
+            assert a_posts == {post_a["post_id"]}
+            assert {s["site_id"] for s in sup_a} == {s_a["site_id"]}
+
+            # Le client A ne peut pinger que son poste (403 sur celui de B)
+            r = _api("POST", f"/api/v1/posts/{post_b['post_id']}/ping", headers=a["headers"])
+            assert r.status_code == 403
+            r = _api("POST", f"/api/v1/posts/{post_a['post_id']}/ping", headers=a["headers"])
+            assert r.status_code == 200
+        finally:
+            self._delete_user(admin_headers, a["user"]["user_id"])
+            self._delete_user(admin_headers, b["user"]["user_id"])
+
+    # SCO-10: la supervision inclut aussi les postes des groupes assignés
+    # (union client + groupes), avec un user_code différent de celui du poste
+    def test_sco10_supervision_scoped_by_group(self, admin_headers):
+        a = self._client_headers(admin_headers, permissions=SUPER_PERMISSIONS)
+        c = self._client_headers(admin_headers, permissions=SUPER_PERMISSIONS)
+        try:
+            s_a = self._create_site(admin_headers, f"WSA{_uid()}", a["client"]["user_code"])
+            s_c = self._create_site(admin_headers, f"WSC{_uid()}", c["client"]["user_code"])
+            post_a = self._create_post(a["headers"], s_a["site_id"], f"WPA{_uid()}")
+            post_c = self._create_post(c["headers"], s_c["site_id"], f"WPC{_uid()}")
+
+            # Groupe ne contenant que le poste de A
+            g = _api("POST", "/api/v1/groups", json={
+                "name": f"VG{_uid()}", "description": "", "is_active": True,
+            }, headers=admin_headers).json()
+            gid = g["group_id"]
+            r = _api("PUT", f"/api/v1/groups/{gid}/membership", json={
+                "post_ids": [post_a["post_id"]],
+            }, headers=admin_headers)
+            assert r.status_code == 200, r.text
+
+            # Avant assignation : C ne voit que son propre poste, pas celui de A
+            sup_c = _api("GET", "/api/v1/supervision", headers=c["headers"]).json()
+            c_posts = {p["post_id"] for s in sup_c for p in s["posts"]}
+            assert c_posts == {post_c["post_id"]}
+            assert {s["site_id"] for s in sup_c} == {s_c["site_id"]}
+            r = _api("POST", f"/api/v1/posts/{post_a['post_id']}/ping", headers=c["headers"])
+            assert r.status_code == 403
+
+            # On assigne le groupe à C : le poste de A devient visible et pingable
+            self._assign_group(admin_headers, c["user"]["user_id"], [gid])
+            sup_c = _api("GET", "/api/v1/supervision", headers=c["headers"]).json()
+            c_posts = {p["post_id"] for s in sup_c for p in s["posts"]}
+            assert c_posts == {post_a["post_id"], post_c["post_id"]}
+            assert {s["site_id"] for s in sup_c} == {s_a["site_id"], s_c["site_id"]}
+            r = _api("POST", f"/api/v1/posts/{post_a['post_id']}/ping", headers=c["headers"])
+            assert r.status_code == 200
+        finally:
+            self._delete_user(admin_headers, a["user"]["user_id"])
+            self._delete_user(admin_headers, c["user"]["user_id"])

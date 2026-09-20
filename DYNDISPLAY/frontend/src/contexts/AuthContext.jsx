@@ -1,5 +1,11 @@
 import { createContext, useContext, useState, useEffect, useCallback } from 'react';
-import { getMe, loginRequest, logoutRequest, activateAccount } from '../services/auth';
+import {
+  getMe,
+  loginRequest,
+  logoutRequest,
+  activateAccount,
+  activateAccountDevice,
+} from '../services/auth';
 import apiService, { subscribeUnauthorized } from '../services/api';
 
 const AuthContext = createContext(null);
@@ -7,6 +13,7 @@ const AuthContext = createContext(null);
 function getErrorMessage(data) {
   const detail = data?.detail;
   if (typeof detail === 'string' && detail) return detail;
+  if (detail && typeof detail === 'object' && detail.message) return detail.message;
   if (Array.isArray(detail) && detail.length) {
     return detail.map((d) => d.msg || JSON.stringify(d)).filter(Boolean).join('; ');
   }
@@ -67,8 +74,44 @@ export function AuthProvider({ children }) {
         return { success: true };
       }
 
-      const message = result.data?.detail || 'Identifiant ou mot de passe incorrect.';
+      const detail = result.data?.detail;
+      const message = detail || 'Identifiant ou mot de passe incorrect.';
       setError(getErrorMessage(result.data));
+      setLoading(false);
+
+      const gateCode =
+        detail && typeof detail === 'object' && !Array.isArray(detail) ? detail.code : null;
+      if (gateCode === 'account_activation_required' || gateCode === 'device_change_activation_required') {
+        return {
+          success: false,
+          error: message,
+          needsActivation: true,
+          gateCode,
+          accountCode: detail.account_code || null,
+        };
+      }
+      return { success: false, error: message };
+    } catch {
+      const message = 'Erreur de connexion au serveur.';
+      setError(message);
+      setLoading(false);
+      return { success: false, error: message };
+    }
+  };
+
+  const activateDevice = async (loginStr, activationCode, password, clientCode) => {
+    setError(null);
+    setLoading(true);
+    try {
+      const result = await activateAccountDevice(loginStr, activationCode);
+      if (result.ok && result.data && result.data.success) {
+        setLoading(false);
+        return await login(loginStr, password, clientCode);
+      }
+      const detail = result.data?.detail;
+      const message =
+        typeof detail === 'string' && detail ? detail : "Code d'activation invalide ou expiré.";
+      setError(message);
       setLoading(false);
       return { success: false, error: message };
     } catch {
@@ -135,8 +178,10 @@ export function AuthProvider({ children }) {
     refreshUser,
     applySession,
     activate,
+    activateDevice,
     isAuthenticated: !!user,
     isAdmin: user?.profile_name === 'Administrateur',
+    isSuperAdmin: user?.profile_name === 'Administrateur' && !!user?.is_superadmin,
     needsActivation: !!user && user.is_activated === false,
     isActivated: !user || user.is_activated === true,
     hasPermission: (code) => {

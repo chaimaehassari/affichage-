@@ -4,6 +4,7 @@ from psycopg import Connection
 from app.db.database import get_db
 from app.dependencies.auth import require_permission, require_activated
 from app.schemas.supervision import SupervisionSiteOut, HeartbeatRequest
+from app.services.scope import assert_post_scope
 from app.services.supervision_service import SupervisionService
 
 router = APIRouter(prefix="/api/v1", tags=["Supervision"])
@@ -16,7 +17,7 @@ def get_supervision(
     db: Connection = Depends(get_db),
 ):
     service = SupervisionService(db)
-    return service.get_supervision_data()
+    return service.get_supervision_data(current_user)
 
 
 @router.post("/posts/heartbeat")
@@ -38,5 +39,9 @@ def ping_post(
     current_user_activated=Depends(require_activated),
     db: Connection = Depends(get_db),
 ):
+    try:
+        assert_post_scope(db, current_user, post_id)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
     service = SupervisionService(db)
     return service.ping_post(post_id)

@@ -18,8 +18,12 @@ Monorepo `C:\Users\hp\Documents\DYNDISPLAY` :
 
 - Backend démarré sur `127.0.0.1:8000` (auto-reload actif).
 - Frontend : `localhost:5173` avec proxy Vite `/api` et `/media` → `8000`.
-- Base de données : `postgresql://postgres:chaimae@127.0.0.1:5433/DYNDISPLAY`.
-- Compte admin de référence : `admin` / `admin123`.
+- Base de données : URL de connexion PostgreSQL définie via `backend/.env`
+  (variables `POSTGRES_*` — ne jamais committer la vraie valeur, voir
+  `backend/.env.example`).
+- Compte admin de bootstrap : `admin` — mot de passe généré par
+  `backend/seed_admin.py` (aléatoire, affiché une seule fois à la création ;
+  jamais de mot de passe en dur).
 
 ### Modèle de données (principales tables)
 `sites`, `posts` (écrans), `media`, `zone_media`, `layouts` + `layout_zones`,
@@ -151,31 +155,103 @@ Conformément au cahier des charges du module Paramétrage :
   Endpoints : `POST /settings/verify-access` (401 si incorrect), `POST /settings/change-access-password`
   (**403 si non Administrateur**). Frontend : `SettingsAccessModal.jsx` remplace l'ancienne porte
   CODE78, et une section « Mot de passe d'accès » (Admin only) permet de le modifier.
+- **Code d'accès Admin suprême** : quand aucun mot de passe dédié n'est défini, le repli est le code
+  `JJMMAAAA + SUPREME_ADMIN_SECRET` (date du jour dans le fuseau de l'application, **concaténée avec un
+  suffixe secret fixe**, comparé en temps constant via `secrets.compare_digest`). Le suffixe secret
+  (`SUPREME_ADMIN_SECRET`, actuellement **X7K9**) rend le code non devinable à partir de la seule date.
+  ⚠️ **Sécurité** : cette valeur ne doit être communiquée que par canal sécurisé, jamais par email en
+  clair, et **jamais commitée** (elle n'existe que dans le `.env` du serveur). Recommandation : rallonger
+  le secret à l'avenir (4 caractères reste un minimum acceptable, pas un idéal).
 - **Blocage de la réduction des licences** : `update_licenses` refuse de descendre sous le nombre
   réel de sites/postes actifs (message explicite, HTTP 400).
 - **Affluence paramétrable** : voir 3.12.
 - **Traçabilité** : les changements sensibles (mot de passe d'accès, licences) sont journalisés
   en arrière-plan via `log_action` (qui/quoi/quand).
 
+### 3.14 Hiérarchie multi-tenant SUPER ADMIN → ADMIN → CLIENT → UTILISATEURS
+Ajout du modèle de gestion à 4 niveaux (migration **018** `clients`, appliquée en base) :
+- **Table `clients`** : `id`, `code_client` (UNIQUE), `nom_client`, `license_sites`/`license_posts`
+  (quotas du client), `created_at`. Le **client par défaut** est initialisé depuis
+  `general_settings` (code **3C48DBF1**, 433 sites / 588 postes) et tous les sites
+  pré-existants y sont rattachés.
+- **`sites.client_id`** (FK NOT NULL) : lien opérationnel du scoping multi-tenant ;
+  `client_code` (chaîne) reste la colonne de scoping existante (rétro-compatible), `client_id`
+  est dérivé automatiquement à la création/édition d'un site.
+- **`users.client_id`** (FK → `clients`, **NOT NULL** depuis la migration 019) : tout compte
+  est rattaché à un client (code client correspondant au `user_code`, sinon **Client par
+  défaut** — rattachement explicite en base, jamais « sans client »). Un Client peut avoir
+  **plusieurs comptes** sous le même code (la contrainte de code unique est levée pour les
+  codes correspondant à un client existant).
+- **Affectation Admin ↔ Clients (migration 019)** : `admin_clients` (N-N, migration 015) est
+  l'**unique source de vérité** — la colonne `clients.admin_id` (018) a été supprimée après
+  repli de sa valeur vers `admin_clients` (le client par défaut reste affecté au Super Admin).
+  Gestion par les endpoints :
+  - `GET /api/v1/clients` — superadmin : tous ; Admin : ceux qui lui sont affectés.
+  - `GET /api/v1/clients/{code}` — détail (licences, compteurs sites/users/activés, admins) ;
+    **403** hors périmètre, **404** si inconnu.
+  - `PUT /api/v1/clients/{code}/license` — mise à jour des quotas (**Super Admin uniquement**).
+  - `POST /api/v1/admins/{id}/clients` / `DELETE /api/v1/admins/{id}/clients/{code}` — affectation
+    / retrait d'un client à un Admin (**Super Admin uniquement**).
+- **Quota de licence PAR CLIENT** : l'activation d'un compte (`POST /auth/activate-account`)
+  consomme un slot du client **auquel le compte est rattaché** (`users.client_id` →
+  `clients.license_posts`, comptes activés du même client). Depuis la migration 019, **plus
+  aucun repli sur le quota global** (`general_settings`) : un compte sans client n'existe plus
+  (contrainte NOT NULL) et l'activation lève une erreur explicite si le rattachement manque.
+- **Frontend** : page `/admins` dédiée (création/édition/suppression d'Admins, affectation de
+  clients par pastilles +/−, badge « Super Admin », réservée au Super Admin) et section
+  **« Clients (multi-tenant) »** dans l'écran Paramètres (table des clients, quotas, bouton
+  « Appliquer licence » Super Admin, lecture seule pour les Admins).
+- **Android** : le champ « Code client » existe déjà (champ `hint_code` de l'app Licences T2F) —
+  aucun changement nécessaire.
+
+### 3.15 Vérification du scoping multi-tenant (sécurité)
+Blocage des contournements par un Admin classique (`tests/test_v17_multitenant_security.py`, **11 tests**) :
+- ne voit que les clients qui lui sont affectés (liste + détail) ;
+- **ne peut pas** modifier les licences (403), gérer les Admins (403), s'affecter un client
+  lui-même (403), ni accéder à `/clients` avec un profil « Utilisateur » (403) ;
+- le **quota par client** est effectif à l'activation (2e compte bloqué si quota atteint,
+  re-débloqué après augmentation ; un client à quota zéro bloque toute activation) ;
+- les sites d'un client apparaissent bien dans le détail (scoping par `client_id`) ;
+- **source unique** : `clients` ne possède plus de colonne `admin_id` (admin_clients seul),
+  `users.client_id` est NOT NULL, un INSERT SQL sans client_id est rejeté par la base, tout
+  compte est rattaché (code connu → son client, sinon client par défaut), et les helpers de
+  quota d'activation ne lisent plus `general_settings` (non-régression statique).
+
 ---
 
 ## 4. Vérifications
 
 - **Build frontend** : `npm run build` ✅ (Vite) après chaque lot.
-- **Tests backend** (serveur live, SFTP non requis) :
-  - v1 (auth) : 11 passed
+- **Tests backend** (serveur live, SFTP non requis), suite complète au vert :
+  - v1 (auth) : 18 passed
   - v2 (users) : 12 passed
   - v3 (sites/posts — affectation par lot + zones) : 12 passed
+  - v4 (media) : passed
+  - v5 (layouts) : passed
   - v6 (configuration — zones) : 9 passed
-  - v8 (supervision & settings) : 20 passed
-  → **59 tests au total** ✅
-- **Tests v7 (synchronisation)** : non exécutables sans un **serveur SFTP réel** sur le port 22
-  (contrainte d'infrastructure, pas de code).
+  - v7 (synchronisation — hors SFTP réel) : passed (1 skip pré-existant)
+  - v8 (supervision & settings) : passed
+  - v9 (multi-média zones) : passed
+  - v10 (groupes) : passed
+  - v11 (email) : passed
+  - v12 (permissions — scoping zone corrigé) : 8 passed
+  - v13 (activation client) : passed
+  - v14 (scoping client sites/posts) : 10 passed
+  - v15 (scoping média) : 4 passed
+  - v16 (activation compte/appareil) : 8 passed
+  - v17 (sécurité multi-tenant — source unique + client_id obligatoire) : 11 passed
+  - e2e : 3 passed, license_utils : passed
+  → **toute la suite est verte** ✅
 
 ---
 
 ## 5. Points de vigilance / à faire
 
+- **Prochain lot à traiter : écran de création / édition d'un nouveau Client.** Aujourd'hui la
+  table `clients` n'est alimentée qu'en base (migration 018 + INSERT direct dans les tests) ;
+  il manque un écran d'administration (Super Admin) pour créer un client avec son `code_client`,
+  son nom et ses quotas initiaux, et le rattacher à ses Admins — à concevoir sur le modèle des
+  pages Admins/Clients déjà livrées.
 - Redémarrer le **serveur Vite** pour activer le proxy `/media` (le backend auto-reload est actif).
 - L'heure d'affluence est l'heure locale du serveur ; le seuil « gros média » est de 20 Mo par défaut.
 - Le champ SMTP `smtp_password` n'est jamais renvoyé par l'API (sécurité) : l'interface le gère

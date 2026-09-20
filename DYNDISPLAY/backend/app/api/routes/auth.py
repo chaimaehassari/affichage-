@@ -11,6 +11,7 @@ from app.dependencies.auth import get_current_user_dependency
 from app.schemas.auth import (
     LoginRequest, LoginResponse, MessageResponse, UserInfo,
     ForgotPasswordRequest, ResetPasswordRequest, ActivationRequest,
+    ActivateAccountRequest, ActivateAccountResponse,
 )
 from app.services.auth_service import AuthService, _build_user_info
 from app.services.audit_service import log_action
@@ -20,6 +21,27 @@ from app.services.settings_service import SettingsService
 from app.core.security import hash_password, create_access_token, verify_supreme_admin_code
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
+
+DEVICE_HEADER = "X-Device-Id"
+
+
+def _get_device_id(request: Request | None) -> str | None:
+    if not request:
+        return None
+    value = request.headers.get(DEVICE_HEADER)
+    if value:
+        value = value.strip()
+    return value or None
+
+
+def _require_device(request: Request | None) -> str:
+    device_id = _get_device_id(request)
+    if not device_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="L'identifiant de l'appareil (header X-Device-Id) est obligatoire.",
+        )
+    return device_id
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -38,7 +60,86 @@ def login(data: LoginRequest, db: Connection = Depends(get_db), request: Request
             detail="Identifiant, mot de passe ou code client incorrect.",
         )
 
+    device_id = _get_device_id(request)
+    gate_result = _apply_login_device_gate(db, service, data.login, device_id)
+    if gate_result is not None:
+        return gate_result
     return result
+
+
+def _apply_login_device_gate(
+    db: Connection,
+    service: AuthService,
+    login: str,
+    device_id: str | None,
+) -> LoginResponse | None:
+    """Applique le verrou Appareil / Activation au login d'un compte non-superadmin.
+
+    - Admin suprême : exempté (géré avant par _try_supreme_admin_login).
+    - Compte en attente d'activation (requires_activation) : bloqué (403) avec
+      son account_code dans le corps de réponse pour permettre l'activation.
+    - Compte lié à un autre appareil : bloqué (403).
+    - Compte sans appareil lié : liaison silencieuse puis connexion.
+    """
+    row = db.execute(
+        """
+        SELECT u.*, p.name AS profile_name
+        FROM users u
+        LEFT JOIN profiles p ON p.profile_id = u.profile_id
+        WHERE u.login = %s
+        """,
+        (login,),
+    ).fetchone()
+    if not row or row["is_superadmin"]:
+        return None
+
+    if not device_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="L'identifiant de l'appareil (header X-Device-Id) est obligatoire.",
+        )
+
+    account_code = service.ensure_account_code(row)
+    if account_code != row.get("account_code"):
+        db.commit()
+
+    if bool(row.get("requires_activation")):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "account_activation_required",
+                "account_code": account_code,
+                "message": "Ce compte doit être activé par un code d'activation.",
+            },
+        )
+
+    bound_device = row.get("authorized_device_id")
+    if bound_device and bound_device != device_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "device_change_activation_required",
+                "account_code": account_code,
+                "message": "Ce compte est lié à un autre appareil. "
+                           "Contactez l'administrateur ou activez le compte avec un code d'activation.",
+            },
+        )
+
+    if bound_device != device_id:
+        service.bind_device(row["user_id"], device_id)
+        fresh = db.execute(
+            """
+            SELECT u.*, p.name AS profile_name
+            FROM users u
+            LEFT JOIN profiles p ON p.profile_id = u.profile_id
+            WHERE u.user_id = %s
+            """,
+            (row["user_id"],),
+        ).fetchone()
+        user_info = _build_user_info(db, fresh)
+        return LoginResponse(access_token=create_access_token(row["user_id"]), user=user_info)
+
+    return None
 
 
 def _try_supreme_admin_login(db: Connection, data: LoginRequest, request: Request) -> LoginResponse | None:
@@ -102,6 +203,26 @@ def activate_account(
         return service.activate_account(current_user.user_id, data.code)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.post("/activate-account", response_model=ActivateAccountResponse)
+def activate_account_device(
+    data: ActivateAccountRequest,
+    db: Connection = Depends(get_db),
+    request: Request = None,
+):
+    """Active un compte avec un code d'activation et le lie à l'appareil courant.
+
+    Le code d'activation est unique à chaque compte (account_code), signé
+    HMAC-SHA256 et limité dans le temps. Prérequis : header X-Device-Id.
+    """
+    device_id = _require_device(request)
+    service = AuthService(db)
+    try:
+        result = service.activate_device_account(data.login, data.activation_code, device_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return ActivateAccountResponse(success=True, message=result["message"])
 
 
 @router.get("/logins")

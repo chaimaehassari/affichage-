@@ -65,6 +65,13 @@ class TestMediaScope:
         }
         r = _api("POST", "/api/v1/users", json=payload, headers=admin_headers)
         assert r.status_code == 201, r.text
+        account_code = r.json().get("account_code")
+        from app.core.license_utils import generate_activation_code
+        act_code = generate_activation_code(account_code)
+        act = _api("POST", "/api/v1/auth/activate-account",
+                   json={"login": login, "activation_code": act_code},
+                   headers={"X-Device-Id": "pytest-device-0001"})
+        assert act.status_code == 200, act.text
         return {"user_code": user_code, "login": login}
 
     def _find_user(self, admin_headers, login):
@@ -80,7 +87,7 @@ class TestMediaScope:
     def _login(self, login, user_code):
         r = _api("POST", "/api/v1/auth/login", json={
             "login": login, "password": TEST_PASSWORD, "client_code": user_code,
-        })
+        }, headers={"X-Device-Id": "pytest-device-0001"})
         assert r.status_code == 200, r.text
         return r.json()
 

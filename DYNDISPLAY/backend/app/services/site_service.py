@@ -14,7 +14,7 @@ from app.schemas.site import (
 from app.core.config import get_settings
 from app.services.audit_service import log_action
 from app.services.zone_access import assert_zone_allowed
-from app.services.scope import site_in_scope
+from app.services.scope import site_in_scope, scope_sql
 from app.sftp.client import SFTPClient
 
 settings = get_settings()
@@ -24,7 +24,7 @@ class SiteService:
     def __init__(self, conn: Connection):
         self.conn = conn
 
-    def list_sites(self, search: str | None = None, scope: str | None = None) -> list[dict]:
+    def list_sites(self, search: str | None = None, scope=None) -> list[dict]:
         sql = """
             SELECT s.site_id, s.code, s.name, s.address, s.description, s.is_active,
                    s.client_code, s.created_at, s.updated_at, COUNT(p.post_id) AS post_count
@@ -33,9 +33,11 @@ class SiteService:
         """
         params = []
         clauses = []
-        if scope:
-            clauses.append("s.client_code = %s")
-            params.append(scope)
+        if scope is not None and scope != "":
+            frag, args = scope_sql(scope, "s.client_code")
+            if frag:
+                clauses.append(frag.lstrip(" AND "))
+            params.extend(args)
         if search:
             term = f"%{search}%"
             clauses.append("(s.code ILIKE %s OR s.name ILIKE %s)")
@@ -45,7 +47,7 @@ class SiteService:
         sql += " GROUP BY s.site_id ORDER BY s.code"
         return self.conn.execute(sql, params).fetchall()
 
-    def get_site(self, site_id: int, scope: str | None = None) -> dict | None:
+    def get_site(self, site_id: int, scope=None) -> dict | None:
         sql = """
             SELECT s.*, COUNT(p.post_id) AS post_count
             FROM sites s
@@ -53,13 +55,32 @@ class SiteService:
             WHERE s.site_id = %s
         """
         params = [site_id]
-        if scope:
-            sql += " AND s.client_code = %s"
-            params.append(scope)
+        if scope is not None and scope != "":
+            frag, args = scope_sql(scope, "s.client_code")
+            if frag:
+                sql += frag
+            params.extend(args)
         sql += " GROUP BY s.site_id"
         return self.conn.execute(sql, params).fetchone()
 
-    def create_site(self, data: SiteCreate, admin_user_id: int, scope: str | None = None) -> dict:
+    def _resolve_client_id(self, client_code: str | None) -> int | None:
+        """Résout l'identifiant du client rattaché (FK sites.client_id).
+
+        - client_code fourni → client correspondant.
+        - Sinon → client par défaut (premier de la table), jamais None tant
+          qu'un client existe (la colonne client_id est NOT NULL).
+        """
+        if client_code:
+            row = self.conn.execute(
+                "SELECT id FROM clients WHERE code_client = %s",
+                (client_code,),
+            ).fetchone()
+            if row:
+                return row["id"]
+        row = self.conn.execute("SELECT id FROM clients ORDER BY id LIMIT 1").fetchone()
+        return row["id"] if row else None
+
+    def create_site(self, data: SiteCreate, admin_user_id: int, scope=None) -> dict:
         existing = self.conn.execute(
             "SELECT site_id FROM sites WHERE code = %s",
             (data.code,),
@@ -67,15 +88,23 @@ class SiteService:
         if existing:
             raise ValueError("Ce code de site existe déjà.")
 
-        client_code = scope if scope is not None else (data.client_code or None)
+        if isinstance(scope, list):
+            requested = (data.client_code or "").strip()
+            if not requested or requested not in scope:
+                raise ValueError("Le code client doit faire partie de vos clients assignés.")
+            client_code = requested
+        else:
+            client_code = scope if scope is not None else (data.client_code or None)
 
+        client_id = self._resolve_client_id(client_code)
         row = self.conn.execute(
             """
-            INSERT INTO sites (code, name, address, description, is_active, client_code)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            INSERT INTO sites (code, name, address, description, is_active, client_code, client_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             RETURNING site_id
             """,
-            (data.code, data.name, data.address, data.description, data.is_active, client_code),
+            (data.code, data.name, data.address, data.description, data.is_active,
+             client_code, client_id),
         ).fetchone()
         site_id = row["site_id"]
 
@@ -86,7 +115,7 @@ class SiteService:
         )
         return self.get_site(site_id)
 
-    def update_site(self, site_id: int, data: SiteUpdate, admin_user_id: int, scope: str | None = None) -> dict:
+    def update_site(self, site_id: int, data: SiteUpdate, admin_user_id: int, scope=None) -> dict:
         site = self.get_site(site_id, scope)
         if not site:
             raise ValueError("Site introuvable.")
@@ -100,16 +129,17 @@ class SiteService:
                 raise ValueError("Ce code de site existe déjà.")
 
         client_code = site["client_code"] if scope is not None else (data.client_code or None)
+        client_id = self._resolve_client_id(client_code)
 
         self.conn.execute(
             """
             UPDATE sites
             SET code = %s, name = %s, address = %s, description = %s, is_active = %s,
-                client_code = %s, updated_at = %s
+                client_code = %s, client_id = %s, updated_at = %s
             WHERE site_id = %s
             """,
             (data.code, data.name, data.address, data.description, data.is_active,
-             client_code, datetime.now(timezone.utc), site_id),
+             client_code, client_id, datetime.now(timezone.utc), site_id),
         )
         log_action(
             self.conn, admin_user_id, "site_update",
@@ -118,7 +148,7 @@ class SiteService:
         )
         return self.get_site(site_id)
 
-    def delete_site(self, site_id: int, admin_user_id: int, scope: str | None = None) -> None:
+    def delete_site(self, site_id: int, admin_user_id: int, scope=None) -> None:
         site = self.get_site(site_id, scope)
         if not site:
             raise ValueError("Site introuvable.")
@@ -140,7 +170,7 @@ class PostService:
         self.conn = conn
 
     def list_posts(self, site_id: int | None = None, search: str | None = None,
-                   scope: str | None = None) -> list[dict]:
+                   scope=None) -> list[dict]:
         sql = """
             SELECT p.*, s.name AS site_name
             FROM posts p
@@ -151,9 +181,11 @@ class PostService:
         if site_id:
             clauses.append("p.site_id = %s")
             params.append(site_id)
-        if scope:
-            clauses.append("s.client_code = %s")
-            params.append(scope)
+        if scope is not None and scope != "":
+            frag, args = scope_sql(scope, "s.client_code")
+            if frag:
+                clauses.append(frag.lstrip(" AND "))
+            params.extend(args)
         if search:
             term = f"%{search}%"
             clauses.append("(p.code ILIKE %s OR p.name ILIKE %s)")
@@ -163,7 +195,7 @@ class PostService:
         sql += " ORDER BY p.code"
         return self.conn.execute(sql, params).fetchall()
 
-    def get_post(self, post_id: int, scope: str | None = None) -> dict | None:
+    def get_post(self, post_id: int, scope=None) -> dict | None:
         sql = """
             SELECT p.*, s.name AS site_name
             FROM posts p
@@ -171,12 +203,14 @@ class PostService:
             WHERE p.post_id = %s
         """
         params = [post_id]
-        if scope:
-            sql += " AND s.client_code = %s"
-            params.append(scope)
+        if scope is not None and scope != "":
+            frag, args = scope_sql(scope, "s.client_code")
+            if frag:
+                sql += frag
+            params.extend(args)
         return self.conn.execute(sql, params).fetchone()
 
-    def create_post(self, data: PostCreate, admin_user_id: int, scope: str | None = None) -> dict:
+    def create_post(self, data: PostCreate, admin_user_id: int, scope=None) -> dict:
         site = self.conn.execute(
             "SELECT site_id, client_code FROM sites WHERE site_id = %s",
             (data.site_id,),
@@ -210,7 +244,7 @@ class PostService:
         )
         return self.get_post(post_id)
 
-    def update_post(self, post_id: int, data: PostUpdate, admin_user_id: int, scope: str | None = None) -> dict:
+    def update_post(self, post_id: int, data: PostUpdate, admin_user_id: int, scope=None) -> dict:
         post = self.get_post(post_id, scope)
         if not post:
             raise ValueError("Poste introuvable.")
@@ -248,7 +282,7 @@ class PostService:
         )
         return self.get_post(post_id)
 
-    def delete_post(self, post_id: int, admin_user_id: int, scope: str | None = None) -> None:
+    def delete_post(self, post_id: int, admin_user_id: int, scope=None) -> None:
         post = self.get_post(post_id, scope)
         if not post:
             raise ValueError("Poste introuvable.")
@@ -261,7 +295,7 @@ class PostService:
         )
 
     def batch_assign_media(self, data: BatchAssignMediaRequest, admin_user_id: int,
-                           scope: str | None = None) -> dict:
+                           scope=None) -> dict:
         self._assert_zone_allowed(admin_user_id, data.zone_number)
 
         success = []
@@ -285,7 +319,7 @@ class PostService:
                 "SELECT media_id, client_code FROM media WHERE media_id = %s",
                 (data.media_id,),
             ).fetchone()
-            if not media or (scope is not None and media["client_code"] != scope):
+            if not media or (scope is not None and not site_in_scope(scope, media["client_code"])):
                 failed.append(post_id)
                 continue
 
@@ -331,17 +365,19 @@ class GroupService:
     def __init__(self, conn: Connection):
         self.conn = conn
 
-    def list_groups(self) -> list[dict]:
-        return self.conn.execute(
-            """
+    def list_groups(self, allowed_group_ids: set[int] | None = None) -> list[dict]:
+        sql = """
             SELECT g.group_id, g.name, g.description, g.is_active, g.created_at, g.updated_at,
                    COUNT(sgp.group_post_id) AS post_count
             FROM screen_groups g
             LEFT JOIN screen_group_posts sgp ON sgp.group_id = g.group_id
-            GROUP BY g.group_id
-            ORDER BY g.name
-            """
-        ).fetchall()
+        """
+        params = []
+        if allowed_group_ids is not None:
+            sql += " WHERE g.group_id = ANY(%s)"
+            params.append(list(allowed_group_ids))
+        sql += " GROUP BY g.group_id ORDER BY g.name"
+        return self.conn.execute(sql, params).fetchall()
 
     def get_group(self, group_id: int) -> dict | None:
         return self.conn.execute(
@@ -349,7 +385,8 @@ class GroupService:
             (group_id,),
         ).fetchone()
 
-    def create_group(self, data: GroupCreate, admin_user_id: int) -> dict:
+    def create_group(self, data: GroupCreate, admin_user_id: int,
+                    assign_to_user: int | None = None) -> dict:
         row = self.conn.execute(
             """
             INSERT INTO screen_groups (name, description, is_active)
@@ -359,6 +396,11 @@ class GroupService:
             (data.name, data.description, data.is_active),
         ).fetchone()
         group_id = row["group_id"]
+        if assign_to_user:
+            self.conn.execute(
+                "INSERT INTO user_group_access (user_id, group_id, is_allowed) VALUES (%s, %s, TRUE)",
+                (assign_to_user, group_id),
+            )
         log_action(
             self.conn, admin_user_id, "group_create",
             "screen_group", None,
@@ -392,6 +434,7 @@ class GroupService:
             raise ValueError("Groupe introuvable.")
 
         self.conn.execute("DELETE FROM screen_group_posts WHERE group_id = %s", (group_id,))
+        self.conn.execute("DELETE FROM user_group_access WHERE group_id = %s", (group_id,))
         self.conn.execute("DELETE FROM screen_groups WHERE group_id = %s", (group_id,))
         log_action(
             self.conn, admin_user_id, "group_delete",
@@ -399,7 +442,7 @@ class GroupService:
             f"Suppression du groupe {group['name']}",
         )
 
-    def get_group_posts(self, group_id: int, scope: str | None = None) -> list[dict]:
+    def get_group_posts(self, group_id: int, scope=None) -> list[dict]:
         sql = """
             SELECT p.post_id, p.code, p.name, s.name AS site_name
             FROM posts p
@@ -408,30 +451,35 @@ class GroupService:
             WHERE sgp.group_id = %s
         """
         params = [group_id]
-        if scope:
-            sql += " AND s.client_code = %s"
-            params.append(scope)
+        if scope is not None and scope != "":
+            frag, args = scope_sql(scope, "s.client_code")
+            if frag:
+                sql += frag
+            params.extend(args)
         sql += " ORDER BY p.code"
         return self.conn.execute(sql, params).fetchall()
 
-    def _scoped_post_ids(self, post_ids: list[int], scope: str | None) -> list[int]:
+    def _scoped_post_ids(self, post_ids: list[int], scope) -> list[int]:
         if not post_ids:
             return []
         if scope is None:
             return list(post_ids)
-        rows = self.conn.execute(
-            """
+        sql = """
             SELECT p.post_id
             FROM posts p
             LEFT JOIN sites s ON s.site_id = p.site_id
-            WHERE p.post_id = ANY(%s) AND s.client_code = %s
-            """,
-            (list(post_ids), scope),
-        ).fetchall()
+            WHERE p.post_id = ANY(%s)
+        """
+        params = [list(post_ids)]
+        frag, args = scope_sql(scope, "s.client_code")
+        if frag:
+            sql += frag
+        params.extend(args)
+        rows = self.conn.execute(sql, params).fetchall()
         return [r["post_id"] for r in rows]
 
     def add_posts_to_group(self, group_id: int, post_ids: list[int], admin_user_id: int,
-                           scope: str | None = None) -> None:
+                           scope=None) -> None:
         group = self.get_group(group_id)
         if not group:
             raise ValueError("Groupe introuvable.")
@@ -462,7 +510,7 @@ class GroupService:
             )
 
     def remove_posts_from_group(self, group_id: int, post_ids: list[int], admin_user_id: int,
-                                scope: str | None = None) -> None:
+                                scope=None) -> None:
         group = self.get_group(group_id)
         if not group:
             raise ValueError("Groupe introuvable.")
@@ -484,7 +532,7 @@ class GroupService:
             )
 
     def set_group_membership(self, group_id: int, post_ids: list[int], admin_user_id: int,
-                             scope: str | None = None) -> dict:
+                             scope=None) -> dict:
         """Remplace l'ensemble des postes du groupe (idempotent, sans doublon).
 
         Les postes non listés sont retirés ; les postes listés sont ajoutés.
@@ -539,7 +587,7 @@ class GroupService:
 
         return self.get_group_composition(group_id, scope)
 
-    def get_group_composition(self, group_id: int, scope: str | None = None) -> dict | None:
+    def get_group_composition(self, group_id: int, scope=None) -> dict | None:
         """Retourne le groupe avec ses sites et les postes (avec appartenance)."""
         group = self.get_group(group_id)
         if not group:
@@ -555,9 +603,11 @@ class GroupService:
 
         sites_sql = "SELECT s.site_id, s.code, s.name FROM sites s WHERE s.is_active = TRUE"
         params = []
-        if scope:
-            sites_sql += " AND s.client_code = %s"
-            params.append(scope)
+        if scope is not None and scope != "":
+            frag, args = scope_sql(scope, "s.client_code")
+            if frag:
+                sites_sql += frag
+            params.extend(args)
         sites_sql += " ORDER BY s.name"
 
         sites = self.conn.execute(sites_sql, params).fetchall()
@@ -609,7 +659,7 @@ class GroupService:
         group_id: int,
         data,
         admin_user_id: int,
-        scope: str | None = None,
+        scope=None,
     ) -> dict:
         """Applique une configuration d'affichage à tous les postes du groupe.
 
@@ -694,32 +744,36 @@ class MediaService:
     def __init__(self, conn: Connection):
         self.conn = conn
 
-    def list_media(self, media_type: str | None = None, scope: str | None = None) -> list[dict]:
+    def list_media(self, media_type: str | None = None, scope=None) -> list[dict]:
         sql = "SELECT * FROM media WHERE is_active = TRUE"
         params = []
-        if scope:
-            sql += " AND client_code = %s"
-            params.append(scope)
+        if scope is not None and scope != "":
+            frag, args = scope_sql(scope, "client_code")
+            if frag:
+                sql += frag
+            params.extend(args)
         if media_type:
             sql += " AND media_type = %s"
             params.append(media_type.upper())
         sql += " ORDER BY created_at DESC"
         return self.conn.execute(sql, params).fetchall()
 
-    def get_media(self, media_id: int, scope: str | None = None) -> dict | None:
+    def get_media(self, media_id: int, scope=None) -> dict | None:
         sql = "SELECT * FROM media WHERE media_id = %s AND is_active = TRUE"
         params = [media_id]
-        if scope:
-            sql += " AND client_code = %s"
-            params.append(scope)
+        if scope is not None and scope != "":
+            frag, args = scope_sql(scope, "client_code")
+            if frag:
+                sql += frag
+            params.extend(args)
         return self.conn.execute(sql, params).fetchone()
 
-    def delete_media(self, media_id: int, admin_user_id: int, scope: str | None = None) -> None:
+    def delete_media(self, media_id: int, admin_user_id: int, scope=None) -> None:
         media = self.conn.execute(
             "SELECT * FROM media WHERE media_id = %s",
             (media_id,),
         ).fetchone()
-        if not media or (scope is not None and media["client_code"] != scope):
+        if not media or (scope is not None and not site_in_scope(scope, media["client_code"])):
             raise ValueError("Média introuvable.")
 
         usage = self.conn.execute(

@@ -11,10 +11,12 @@ const ZONES = [1, 2, 3, 4, 5, 6, 7, 8];
 export default function UserForm() {
   const { id } = useParams();
   const isEdit = Boolean(id);
-  const { logout, user: currentUser, canAccessZone } = useAuth();
+  const { logout, user: currentUser, canAccessZone, isSuperAdmin } = useAuth();
   const navigate = useNavigate();
   const [profiles, setProfiles] = useState([]);
+  const [admins, setAdmins] = useState([]);
   const [allPermissions, setAllPermissions] = useState([]);
+  const [groupsList, setGroupsList] = useState([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [notification, setNotification] = useState(null);
@@ -25,9 +27,11 @@ export default function UserForm() {
     password: '',
     password_confirm: '',
     profile_id: '',
+    admin_id: null,
     is_active: true,
     requires_activation: false,
     zones: [],
+    groups: [],
     permissions: [],
   });
 
@@ -40,12 +44,21 @@ export default function UserForm() {
 
   useEffect(() => {
     async function init() {
-      const [profilesRes, permsRes] = await Promise.all([
+      const [profilesRes, permsRes, groupsRes] = await Promise.all([
         apiService.get('/api/v1/users/profiles'),
         apiService.get('/api/v1/users/permissions'),
+        apiService.get('/api/v1/groups'),
       ]);
       if (profilesRes.ok) setProfiles(profilesRes.data || []);
       if (permsRes.ok) setAllPermissions(permsRes.data || []);
+      if (groupsRes.ok) setGroupsList(groupsRes.data || []);
+
+      let adminList = [];
+      if (isSuperAdmin) {
+        const adminsRes = await apiService.get('/api/v1/admins');
+        adminList = adminsRes.ok ? (adminsRes.data?.admins || []) : [];
+        setAdmins(adminList);
+      }
 
       if (isEdit) {
         const userRes = await apiService.get(`/api/v1/users/${id}`);
@@ -59,6 +72,8 @@ export default function UserForm() {
             profile_id: u.profile_id,
             is_active: u.is_active,
             requires_activation: u.is_activated === false,
+            admin_id: u.admin_id || '',
+            admin_code: adminList.find(a => String(a.user_id) === String(u.admin_id))?.user_code || '',
             zones: (u.zones || []).filter(z => z.is_allowed).map(z => z.zone_number),
             permissions: (u.permissions || []).map(p => ({
               permission_id: p.permission_id,
@@ -76,7 +91,23 @@ export default function UserForm() {
   }, [id, isEdit]);
 
   function updateField(key, value) {
-    setForm(prev => ({ ...prev, [key]: value }));
+    setForm(prev => {
+      const next = { ...prev, [key]: value };
+      if (key === 'profile_id') {
+        const p = profiles.find(x => String(x.profile_id) === String(value));
+        if (p && p.name === 'Administrateur') {
+          next.admin_code = '';
+          next.admin_id = '';
+        }
+      }
+      return next;
+    });
+  }
+
+  function resolveAdminCode(code) {
+    const c = (code || '').trim().toUpperCase();
+    if (!c) return null;
+    return admins.find(a => String(a.user_code || '').toUpperCase() === c) || null;
   }
 
   function toggleZone(zone) {
@@ -110,6 +141,16 @@ export default function UserForm() {
     setSaving(true);
     setNotification(null);
 
+    if (needsAdmin && form.admin_code.trim() && !resolvedAdmin) {
+      setSaving(false);
+      setNotification({ type: 'error', text: 'Code admin introuvable : saisissez un code admin existant.' });
+      return;
+    }
+
+    const adminIdToSend = needsAdmin
+      ? (resolvedAdmin ? resolvedAdmin.user_id : null)
+      : (isSuperAdmin ? (form.admin_id || null) : (currentUser?.user_id || null));
+
     try {
       let result;
       if (isEdit) {
@@ -119,13 +160,10 @@ export default function UserForm() {
           profile_id: parseInt(form.profile_id),
           is_active: form.is_active,
           requires_activation: form.requires_activation,
+          admin_id: adminIdToSend,
           zones: form.zones,
           permissions: form.permissions,
         };
-        if (form.password) {
-          payload.new_password = form.password;
-          payload.password_confirm = form.password_confirm;
-        }
         result = await apiService.put(`/api/v1/users/${id}`, payload);
       } else {
         result = await apiService.post('/api/v1/users', {
@@ -136,6 +174,7 @@ export default function UserForm() {
           profile_id: parseInt(form.profile_id),
           is_active: form.is_active,
           requires_activation: form.requires_activation,
+          admin_id: adminIdToSend,
           zones: form.zones,
           permissions: form.permissions,
         });
@@ -184,6 +223,9 @@ export default function UserForm() {
   const menuPerms = allPermissions.filter(p => ['menu_conception', 'menu_sync', 'menu_media', 'menu_config'].includes(p.code));
   const userPerms = allPermissions.filter(p => ['user_list', 'user_create', 'user_update', 'user_delete'].includes(p.code));
   const sitePerms = allPermissions.filter(p => ['list_sites_posts', 'create_site', 'update_site', 'delete_site', 'create_post', 'update_post', 'delete_post'].includes(p.code));
+  const selectedProfile = profiles.find(p => String(p.profile_id) === String(form.profile_id))?.name || '';
+  const needsAdmin = isSuperAdmin && selectedProfile && selectedProfile !== 'Administrateur';
+  const resolvedAdmin = needsAdmin ? resolveAdminCode(form.admin_code) : null;
 
   if (loading) {
     return (
@@ -211,7 +253,12 @@ export default function UserForm() {
       {showResetModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
           <div className="bg-[#1a1f24] border border-white/10 rounded-lg p-6 w-96 shadow-2xl">
-            <h3 className="text-white font-semibold text-sm mb-4">Réinitialiser le mot de passe</h3>
+            <h3 className="text-white font-semibold text-sm mb-2">Réinitialiser le mot de passe</h3>
+            <p className="text-[#a0a7b3] text-xs mb-4">
+              Définissez un mot de passe temporaire pour cet utilisateur. Il ne vous sera pas
+              possible de connaître l'ancien mot de passe, et l'utilisateur devra le modifier
+              lors de sa prochaine connexion.
+            </p>
             <div className="space-y-3">
               <input type="password" placeholder="Nouveau mot de passe" value={resetForm.new_password} onChange={(e) => setResetForm(p => ({ ...p, new_password: e.target.value }))}
                 className="w-full bg-[#111418] text-white placeholder-[#a0a7b3] px-3 py-2.5 rounded-lg border border-white/10 text-sm focus:outline-none focus:border-[#f6c200]/50" />
@@ -277,14 +324,33 @@ export default function UserForm() {
                     <input type="text" value={form.login} onChange={(e) => updateField('login', e.target.value)} required
                       className="w-full bg-[#1a1f24] text-white placeholder-[#a0a7b3] px-3 py-2.5 rounded-lg border border-white/10 text-sm focus:outline-none focus:border-[#f6c200]/50" />
                   </div>
-                  <div>
-                    <label className="block text-xs text-[#a0a7b3] mb-1.5">Profil <span className="text-red-400">*</span></label>
-                    <select value={form.profile_id} onChange={(e) => updateField('profile_id', e.target.value)} required
-                      className="w-full bg-[#1a1f24] text-white px-3 py-2.5 rounded-lg border border-white/10 text-sm focus:outline-none focus:border-[#f6c200]/50 appearance-none">
-                      <option value="">-- Sélectionner --</option>
-                      {profiles.map(p => <option key={p.profile_id} value={p.profile_id}>{p.name}</option>)}
-                    </select>
-                  </div>
+<div>
+                        <label className="block text-xs text-[#a0a7b3] mb-1.5">Profil <span className="text-red-400">*</span></label>
+                        <select value={form.profile_id} onChange={(e) => updateField('profile_id', e.target.value)} required
+                          className="w-full bg-[#1a1f24] text-white px-3 py-2.5 rounded-lg border border-white/10 text-sm focus:outline-none focus:border-[#f6c200]/50 appearance-none">
+                          <option value="">-- Sélectionner --</option>
+                          {profiles.map(p => <option key={p.profile_id} value={p.profile_id}>{p.name}</option>)}
+                        </select>
+                      </div>
+                      {needsAdmin && (
+                        <div>
+                          <label className="block text-xs text-[#a0a7b3] mb-1.5">Code Admin</label>
+                          <input type="text" value={form.admin_code}
+                            onChange={(e) => {
+                              const code = e.target.value;
+                              const matched = resolveAdminCode(code);
+                              setForm(prev => ({ ...prev, admin_code: code, admin_id: matched ? matched.user_id : '' }));
+                            }}
+                            placeholder="Code admin responsable"
+                            className={`w-full bg-[#1a1f24] text-white placeholder-[#a0a7b3] px-3 py-2.5 rounded-lg border text-sm focus:outline-none focus:border-[#f6c200]/50 ${form.admin_code.trim() && !resolvedAdmin ? 'border-red-500/60' : 'border-white/10'}`} />
+                          {form.admin_code.trim() && !resolvedAdmin && (
+                            <p className="text-[11px] text-red-400 mt-1">Code admin introuvable : saisissez un code admin existant.</p>
+                          )}
+                          {resolvedAdmin && (
+                            <p className="text-[11px] text-green-400 mt-1">✓ Admin : {resolvedAdmin.user_code || ''}{resolvedAdmin.login ? ` — ${resolvedAdmin.login}` : ''}</p>
+                          )}
+                        </div>
+                      )}
                   <div>
                     <label className="block text-xs text-[#a0a7b3] mb-1.5">Statut</label>
                     <div className="flex items-center gap-3 py-2.5">
@@ -308,28 +374,30 @@ export default function UserForm() {
                       <p className="text-[11px] text-[#f6c200]">Le client devra saisir son code de sérialisation avant de pouvoir accéder à l'application.</p>
                     )}
                   </div>
-                  <div className="relative">
-                    <label className="block text-xs text-[#a0a7b3] mb-1.5">Mot de passe {!isEdit && <span className="text-red-400">*</span>}</label>
-                    <div className="relative">
-                      <input type={showPassword ? 'text' : 'password'} value={form.password} onChange={(e) => updateField('password', e.target.value)} required={!isEdit}
-                        placeholder={isEdit ? 'Laisser vide pour conserver' : ''}
-                        className="w-full bg-[#1a1f24] text-white placeholder-[#a0a7b3] px-3 py-2.5 pr-10 rounded-lg border border-white/10 text-sm focus:outline-none focus:border-[#f6c200]/50" />
-                      <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-[#a0a7b3] hover:text-white transition-colors">
-                        {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                      </button>
-                    </div>
-                  </div>
-                  <div className="relative">
-                    <label className="block text-xs text-[#a0a7b3] mb-1.5">Confirmation {!isEdit && <span className="text-red-400">*</span>}</label>
-                    <div className="relative">
-                      <input type={showConfirm ? 'text' : 'password'} value={form.password_confirm} onChange={(e) => updateField('password_confirm', e.target.value)} required={!isEdit}
-                        placeholder={isEdit ? 'Confirmer le mot de passe' : ''}
-                        className="w-full bg-[#1a1f24] text-white placeholder-[#a0a7b3] px-3 py-2.5 pr-10 rounded-lg border border-white/10 text-sm focus:outline-none focus:border-[#f6c200]/50" />
-                      <button type="button" onClick={() => setShowConfirm(!showConfirm)} className="absolute right-3 top-1/2 -translate-y-1/2 text-[#a0a7b3] hover:text-white transition-colors">
-                        {showConfirm ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                      </button>
-                    </div>
-                  </div>
+                  {!isEdit && (
+                    <>
+                      <div className="relative">
+                        <label className="block text-xs text-[#a0a7b3] mb-1.5">Mot de passe <span className="text-red-400">*</span></label>
+                        <div className="relative">
+                          <input type={showPassword ? 'text' : 'password'} value={form.password} onChange={(e) => updateField('password', e.target.value)} required
+                            className="w-full bg-[#1a1f24] text-white placeholder-[#a0a7b3] px-3 py-2.5 pr-10 rounded-lg border border-white/10 text-sm focus:outline-none focus:border-[#f6c200]/50" />
+                          <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-[#a0a7b3] hover:text-white transition-colors">
+                            {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                          </button>
+                        </div>
+                      </div>
+                      <div className="relative">
+                        <label className="block text-xs text-[#a0a7b3] mb-1.5">Confirmation <span className="text-red-400">*</span></label>
+                        <div className="relative">
+                          <input type={showConfirm ? 'text' : 'password'} value={form.password_confirm} onChange={(e) => updateField('password_confirm', e.target.value)} required
+                            className="w-full bg-[#1a1f24] text-white placeholder-[#a0a7b3] px-3 py-2.5 pr-10 rounded-lg border border-white/10 text-sm focus:outline-none focus:border-[#f6c200]/50" />
+                          <button type="button" onClick={() => setShowConfirm(!showConfirm)} className="absolute right-3 top-1/2 -translate-y-1/2 text-[#a0a7b3] hover:text-white transition-colors">
+                            {showConfirm ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                          </button>
+                        </div>
+                      </div>
+                    </>
+                  )}
                 </div>
               </div>
 

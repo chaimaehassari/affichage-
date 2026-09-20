@@ -57,15 +57,15 @@ POSTGRES_HOST=localhost
 POSTGRES_PORT=5433
 POSTGRES_DB=DYNDISPLAY
 POSTGRES_USER=postgres
-POSTGRES_PASSWORD=chaimae
+POSTGRES_PASSWORD=changeme   <-- remplacer par votre vrai mot de passe (.env jamais committé)
 
 SFTP_HOST=127.0.0.1
 SFTP_PORT=22
-SFTP_USERNAME=chaimae
-SFTP_PASSWORD=chaimae
+SFTP_USERNAME=changeme
+SFTP_PASSWORD=changeme
 SFTP_ROOT_PATH=/C:/DYNDISPLAY-SFTP
 
-JWT_SECRET_KEY=dyndisplay-dev-secret-key
+JWT_SECRET_KEY=<openssl rand -hex 32>   <-- obligatoire pour démarrer, ne jamais committer
 JWT_ALGORITHM=HS256
 ACCESS_TOKEN_EXPIRE_MINUTES=60
 CORS_ORIGINS=http://localhost:5173
@@ -175,8 +175,8 @@ pytest tests/test_v8_supervision_settings.py  # supervision + paramètres
 **Comptes de test :**
 | Login | Mot de passe | Profil |
 |-------|-------------|--------|
-| admin | admin123 | Administrateur |
-| chaimae | admin123 | Administrateur |
+| admin | généré par `seed_admin.py` (affiché une seule fois ; `SEED_ADMIN_PASSWORD` pour le dev/tests) | Administrateur |
+| supervisor1, operator1, operator2, viewer1 | générés par `seed_data.py` (aléatoires, affichés une seule fois) | voir seed_data.py |
 
 **Ports :**
 | Service | Port |
