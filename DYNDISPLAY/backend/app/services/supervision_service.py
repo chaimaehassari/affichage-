@@ -1,3 +1,4 @@
+import logging
 import platform
 import re
 import subprocess
@@ -6,6 +7,8 @@ from datetime import datetime, timezone, timedelta
 from psycopg import Connection
 
 from app.services.scope import is_admin, is_superadmin, is_regular_admin, admin_client_codes
+
+logger = logging.getLogger(__name__)
 
 HEARTBEAT_OFFLINE_THRESHOLD_SECONDS = 90
 PING_TIMEOUT_SECONDS = 5
@@ -171,6 +174,7 @@ class SupervisionService:
         except subprocess.TimeoutExpired:
             return {"reachable": False, "rtt_ms": None, "message": "Délai dépassé (timeout)."}
         except Exception as exc:
+            logger.warning("Ping impossible pour le poste %s (%s) : %s", post["post_id"], ip, exc)
             return {"reachable": False, "rtt_ms": None, "message": f"Ping impossible : {exc}"}
 
         rtt = self._extract_rtt_ms(output)

@@ -35,19 +35,61 @@ def create_access_token(user_id: int) -> str:
     expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     payload = {
         "sub": str(user_id),
+        "typ": "access",
         "exp": expire,
     }
     return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 
 def decode_access_token(token: str) -> dict | None:
+    """Décode un token de SESSION uniquement (typ=access).
+
+    Les tokens média (typ=media) ne doivent JAMAIS être acceptés comme token
+    d'API : ils circulent dans des URL et sont de simples accès signés à un
+    fichier. La vérification stricte de `typ` empêche un token média volé
+    d'être réutilisé comme session.
+    """
     try:
         payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
-        return payload
     except jwt.ExpiredSignatureError:
         return None
     except jwt.InvalidTokenError:
         return None
+    if payload.get("typ") != "access":
+        return None
+    return payload
+
+
+def create_media_token(user_id: int, media_path: str) -> str:
+    """Token dédié à l'accès d'UN SEUL fichier média via /media/{path}.
+
+    Distinct du token de session : durée de vie courte (MEDIA_TOKEN_EXPIRE_MINUTES),
+    scopé au chemin exact du média, typ=media. Porté dans l'URL (?token=) pour les
+    balises <img>/<video>, donc volontairement inutilisable sur l'API.
+    """
+    expire = datetime.now(timezone.utc) + timedelta(minutes=settings.MEDIA_TOKEN_EXPIRE_MINUTES)
+    payload = {
+        "sub": str(user_id),
+        "typ": "media",
+        "media_path": media_path,
+        "exp": expire,
+    }
+    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
+def decode_media_token(token: str) -> dict | None:
+    """Décode un token MÉDIA uniquement (typ=media, media_path présent)."""
+    try:
+        payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+    if payload.get("typ") != "media":
+        return None
+    if not payload.get("media_path"):
+        return None
+    return payload
 
 
 def verify_supreme_admin_code(code: str, username: str | None = None) -> bool:

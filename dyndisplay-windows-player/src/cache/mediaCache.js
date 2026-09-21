@@ -35,6 +35,29 @@ export async function storeSyncedConfig(config) {
 }
 
 /**
+ * Nombre de médias référencés par config.json absents du cache local.
+ * Permet de relancer un téléchargement même si l'empreinte de config
+ * n'a pas changé (cas : un premier sync a échoué, fichiers jamais obtenus).
+ */
+export async function missingMediaCount(config) {
+  let missing = 0;
+  const seen = new Set();
+  for (const zone of (config?.zones || [])) {
+    for (const m of (zone?.media_playlist || [])) {
+      if (!m || !m.filename || !m.media_id || seen.has(m.filename)) continue;
+      seen.add(m.filename);
+      try {
+        const exists = await api().cache.mediaExists(m.filename);
+        if (!exists) missing += 1;
+      } catch (err) {
+        missing += 1;
+      }
+    }
+  }
+  return missing;
+}
+
+/**
  * S'assure qu'un média est présent en cache (delta). Conserve silencieusement
  * les médias qui existent déjà : la box continue d'afficher le dernier
  * contenu connu si le serveur/réseau tombe.

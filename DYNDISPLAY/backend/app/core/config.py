@@ -23,12 +23,27 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
 
+    # Durée de vie des tokens MÉDIAS (GET /media/{path} + balises <img>/<video>).
+    # Token dédié, scopé à UN seul fichier média, distinct du token de session :
+    # il circule dans l'URL (?token=) et doit donc rester court vécu (suffisant
+    # pour charger/afficher un média, jamais un accès permanent ni un équivalent
+    # de session). Voir app/core/security.create_media_token.
+    MEDIA_TOKEN_EXPIRE_MINUTES: int = 60
+
     CORS_ORIGINS: str = "http://localhost:5173"
 
     MEDIA_ROOT: str = "./media_storage"
 
     # Dossier contenant le frontend compilé (servi par le backend en mode production Web).
     UI_DIST_PATH: str = ""
+
+    # Nombre maximal de jobs de sync exécutés EN PARALLÈLE (executor borné +
+    # pool de connexions dédié gesto-sync dimensionné à cette valeur). Au-delà,
+    # les jobs attendent dans la file : ils restent PENDING/SCHEDULED et sont
+    # exclus de la reprise des orphelins tant qu'ils sont en file/en cours.
+    # Réglage clé contre la saturation PostgreSQL (max_connections) pendant
+    # l'orage d'auto-sync multi-tenant.
+    SYNC_MAX_WORKERS: int = 8
 
     # Suffixe secret du code d'accès Admin suprême (JJMMAAAA + ce suffixe).
     # Aucune valeur par défaut : le serveur refuse de démarrer si elle est

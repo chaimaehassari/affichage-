@@ -20,6 +20,7 @@ from app.api.routes.sync import router as sync_router
 from app.api.routes.supervision import router as supervision_router
 from app.api.routes.settings import router as settings_router
 from app.api.routes.audit import router as audit_router
+from app.api.routes.media import router as media_router
 from app.sftp.client import SFTPClient
 
 settings = get_settings()
@@ -60,6 +61,7 @@ app.include_router(sync_router, dependencies=[Depends(require_activated)])
 app.include_router(supervision_router)
 app.include_router(settings_router, dependencies=[Depends(require_activated)])
 app.include_router(audit_router, dependencies=[Depends(require_activated)])
+app.include_router(media_router, dependencies=[Depends(require_activated)])
 
 
 def _media_stream(remote_path: str):
@@ -76,15 +78,18 @@ def serve_media(
 ):
     """Sert un média depuis le stockage SFTP, pour les aperçus web.
 
-    PROTÉGÉ PAR JWT : la route exige un token valide (en-tête Authorization
-    OU paramètre `token` — requis pour les balises <img>/<video>). Justification
-    de ne PAS l'exposer publiquement :
+    PROTÉGÉ PAR JWT MÉDIA : la route exige un token MÉDIA dédié (en-tête
+    Authorization OU paramètre `token` — requis pour les balises <img>/<video>).
+    Justification de ne PAS l'exposer publiquement :
       - les players (Android, Windows) lisent directement le partage SFTP et
         n'utilisent JAMAIS cette route HTTP — aucun usage légitime public ;
       - les seuls consommateurs sont les écrans de prévisualisation du
         frontend (sessions authentifiées) ;
-      - le token en query est le JWT court vécu (< ACCESS_TOKEN_EXPIRE_MINUTES),
-        conforme à un accès signé à durée limitée.
+      - le token en query est un token média court vécu
+        (< MEDIA_TOKEN_EXPIRE_MINUTES), scopé au chemin exact du fichier,
+        inutilisable comme token de session (typ=media), distinct du JWT
+        ACCESS de l'API pour limiter l'exposition en cas de fuite dans les
+        logs d'accès / URL.
     """
     clean_path = path.lstrip("/")
     root = settings.SFTP_ROOT_PATH.rstrip("/")
@@ -93,7 +98,14 @@ def serve_media(
         if not probe.exists(remote_path):
             raise HTTPException(status_code=404, detail="Fichier introuvable.")
     media_type = mimetypes.guess_type(clean_path)[0] or "application/octet-stream"
-    return StreamingResponse(_media_stream(remote_path), media_type=media_type)
+    return StreamingResponse(
+        _media_stream(remote_path),
+        media_type=media_type,
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @app.get("/")

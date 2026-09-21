@@ -18,13 +18,18 @@
 | Python | 3.x |
 | FastAPI | >= 0.115.0 |
 | Uvicorn | >= 0.34.0 |
-| SQLAlchemy | >= 2.0.36 |
+| SQLAlchemy | Non utilisé (voir note ci-dessous) |
 | PostgreSQL (psycopg) | >= 3.2.3 |
-| Alembic | >= 1.14.0 |
+| Alembic | Non utilisé (voir note ci-dessous) |
 | Pydantic | >= 2.10.3 |
 | Paramiko (SFTP) | >= 3.5.0 |
 | PyJWT | >= 2.10.1 |
 | Argon2 (passwords) | >= 23.1.0 |
+
+> **Note accès base de données** : SQLAlchemy et Alembic ont figuré dans d'anciennes versions
+> de ce document mais ne sont **pas utilisés**. L'accès PostgreSQL est fait en **SQL brut via
+> psycopg 3 + `psycopg_pool.ConnectionPool`**, et les migrations sont de simples fichiers SQL
+> (`backend/migrations/*.sql`). Ne pas réintroduire d'ORM — voir `backend/ARCHITECTURE.md`.
 
 ### Frontend
 | Technologie | Version |
@@ -54,12 +59,10 @@ DYNDISPLAY/
 │   │   ├── core/             (config.py, security.py)
 │   │   ├── db/               (database.py)
 │   │   ├── dependencies/     (auth.py)
-│   │   ├── models/           (auth.py)
 │   │   ├── schemas/          (auth.py)
 │   │   ├── services/         (auth_service.py, user_service.py, audit_service.py)
 │   │   ├── sftp/             (client.py)
 │   │   └── main.py
-│   ├── alembic/
 │   ├── seed_admin.py
 │   ├── seed_data.py
 │   ├── seed_v2.py
@@ -169,7 +172,7 @@ DYNDISPLAY/
 - [ ] Gestion SFTP (transfert media vers players)
 - [ ] Plannings d'affichage
 - [ ] Dashboard avec statistiques
-- [ ] Alembic migrations (aucune version pour l'instant)
+- [x] Migrations SQL (fichiers `backend/migrations/*.sql`, appliqués par `scripts/migrate.py` — pas d'Alembic)
 - [ ] Tests unitaires
 - [ ] Audit logging complet
 - [ ] Dockerisation fonctionnelle

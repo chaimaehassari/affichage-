@@ -1,9 +1,9 @@
-from fastapi import Depends, HTTPException, Query, status
+from fastapi import Depends, HTTPException, Path, Query, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from psycopg import Connection
 
 from app.db.database import get_db
-from app.core.security import decode_access_token
+from app.core.security import decode_access_token, decode_media_token
 from app.schemas.auth import UserInfo
 from app.services.auth_service import AuthService
 
@@ -115,16 +115,20 @@ def require_admin(
 def require_media_access(
     credentials: HTTPAuthorizationCredentials | None = Depends(media_bearer_scheme),
     token: str | None = Query(None),
+    path: str = Path(...),
     db: Connection = Depends(get_db),
 ) -> UserInfo:
-    """Authentifie l'accès aux médias (GET /media/{path}).
+    """Authentifie et SCOP l'accès aux médias (GET /media/{path}).
 
-    Le token JWT est accepté soit dans l'en-tête `Authorization: Bearer ...`
-    (appels `fetch`/`axios`), soit dans le paramètre de requête `token`
-    (indispensable pour les balises <img>/<video>/<a href> qui ne peuvent pas
-    envoyer d'en-tête d'autorisation). Dans tous les cas le token reste le
-    JWT court vécu standard (ACCESS_TOKEN_EXPIRE_MINUTES) — pas un accès
-    public permanent.
+    Le token accepté est UNIQUEMENT un token média dédié (typ=media) :
+      - soit dans l'en-tête `Authorization: Bearer ...`,
+      - soit dans le paramètre de requête `token` (balises <img>/<video> qui
+        ne peuvent pas envoyer d'en-tête d'autorisation).
+
+    Ce token est court vécu (MEDIA_TOKEN_EXPIRE_MINUTES) et SCOPÉ au chemin
+    exact du média : un token émis pour `media/A.png` ne donne pas accès à
+    `media/B.png`. Le token de session (typ=access) est explicitement refusé
+    ici — il ne circule jamais dans une URL.
     """
     raw_token = (credentials.credentials if credentials else None) or token
     if not raw_token:
@@ -132,11 +136,18 @@ def require_media_access(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentification requise pour accéder aux médias.",
         )
-    payload = decode_access_token(raw_token)
+    payload = decode_media_token(raw_token)
     if payload is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token invalide ou expiré.",
+            detail="Token invalide, expiré, ou non autorisé pour l'accès média.",
+        )
+
+    requested_path = path.lstrip("/")
+    if payload.get("media_path") != requested_path:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Token non autorisé pour ce média.",
         )
 
     user_id = int(payload.get("sub"))

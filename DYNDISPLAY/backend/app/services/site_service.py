@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timezone
 
 from psycopg import Connection
@@ -17,6 +18,7 @@ from app.services.zone_access import assert_zone_allowed
 from app.services.scope import site_in_scope, scope_sql
 from app.sftp.client import SFTPClient
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
@@ -365,6 +367,38 @@ class GroupService:
     def __init__(self, conn: Connection):
         self.conn = conn
 
+    def _savepoint_exec(self, savepoint: str, sql: str, params, purpose: str, ctx: dict) -> bool:
+        """Exécute une opération isolée dans un SAVEPOINT.
+
+        Si l'opération échoue, le SAVEPOINT est annulé (ROLLBACK TO + RELEASE)
+        et l'erreur est loguée à niveau error avec les identifiants concernés :
+        le reste de la transaction reste valide et commitable. S'applique aux
+        opérations "best effort" dont l'échec ne doit pas empoisonner la
+        transaction (même famille que le bug silencieux de sync : une exception
+        avalée sans rollback laisse une transaction abattue et un commit perdu).
+        Retourne True si l'opération a réussi.
+        """
+        self.conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            self.conn.execute(sql, params)
+        except Exception as exc:
+            try:
+                self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            except Exception:
+                self.conn.rollback()
+                raise
+            fields = ", ".join(f"{k}={v}" for k, v in ctx.items())
+            logger.error(
+                "ROLLBACK SAVEPOINT %s — %s (%s, %s) : %s",
+                savepoint, purpose, fields,
+                datetime.now(timezone.utc).isoformat(), exc,
+            )
+            return False
+        else:
+            self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            return True
+
     def list_groups(self, allowed_group_ids: set[int] | None = None) -> list[dict]:
         sql = """
             SELECT g.group_id, g.name, g.description, g.is_active, g.created_at, g.updated_at,
@@ -570,14 +604,15 @@ class GroupService:
 
         if to_add:
             for pid in to_add:
-                try:
-                    self.conn.execute(
-                        "INSERT INTO screen_group_posts (group_id, post_id) VALUES (%s, %s)",
-                        (group_id, pid),
-                    )
-                except Exception:
-                    # Doublon potentiel déjà garanti par l'index unique uq_group_post.
-                    pass
+                # Échec isolé (ex. doublon de course sur uq_group_post) : on ne
+                # touche pas au reste de la transaction (voir _savepoint_exec).
+                self._savepoint_exec(
+                    "group_membership_sp",
+                    "INSERT INTO screen_group_posts (group_id, post_id) VALUES (%s, %s)",
+                    (group_id, pid),
+                    "ajout d'un poste au groupe",
+                    {"group_id": group_id, "post_id": pid},
+                )
 
         log_action(
             self.conn, admin_user_id, "group_set_membership",
@@ -665,7 +700,8 @@ class GroupService:
 
         Pour chaque poste du groupe :
           1. enregistre la configuration (layout, zones/médias) via ConfigurationService,
-          2. si ``sync`` est vrai, lance un job de synchronisation SFTP (thread) via SyncService.
+          2. si ``sync`` est vrai, soumet un job de synchronisation SFTP à
+             l'executor borné (SyncService) — jamais un thread brut.
 
         Retourne les décomptes. Les postes hors groupe ne sont jamais modifiés.
         """
@@ -697,40 +733,81 @@ class GroupService:
         synced_ids = []
 
         for pid in post_ids:
+            # Isolation par poste : une config qui échoue (ex. média disparu,
+            # donnée invalide) est repliée sans empoisonner les postes suivants.
+            # Sans ce SAVEPOINT, une écriture partielle restait dans la
+            # transaction (succès comptabilisé à tort) ou un échec DB déclenchait
+            # une transaction abattue pour tout le groupe (500 + liste erronée).
+            savepoint = "apply_config_sp"
+            self.conn.execute(f"SAVEPOINT {savepoint}")
             try:
                 config_svc.update_configuration(pid, payload, user_id=admin_user_id)
-                success_ids.append(pid)
-            except Exception:
+            except Exception as exc:
+                try:
+                    self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                except Exception:
+                    self.conn.rollback()
+                    raise
+                logger.error(
+                    "ROLLBACK SAVEPOINT apply_config_sp — configuration du poste "
+                    "impossible (group_id=%s post_id=%s, %s) : %s",
+                    group_id, pid, datetime.now(timezone.utc).isoformat(), exc,
+                )
                 failed_ids.append(pid)
+            else:
+                self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                success_ids.append(pid)
 
         if data.sync:
             sync_svc = SyncService(self.conn)
-            import threading
-            from app.db.database import connect_new
-
-            def _run_sync_task(post_id: int, job_id: int):
-                try:
-                    with connect_new() as conn:
-                        SyncService(conn).run_sync(post_id, job_id)
-                except Exception as e:
-                    import logging
-                    logging.getLogger(__name__).error(
-                        f"Group sync thread failed for job {job_id}: {e}", exc_info=True
-                    )
+            from app.services.sync_executor import sync_executor
 
             for pid in success_ids:
                 if sync_svc.check_running_sync(pid):
                     continue
+                # Échec isolé de création de job : le poste est remonté en échec
+                # mais la suite (et la liste des échecs) reste exploitable.
+                self.conn.execute("SAVEPOINT sync_job_sp")
                 try:
                     job = sync_svc.create_job(pid, None)
-                    job_id = job["sync_job_id"]
-                    thread = threading.Thread(
-                        target=_run_sync_task, args=(pid, job_id), daemon=True
+                except Exception as exc:
+                    try:
+                        self.conn.execute("ROLLBACK TO SAVEPOINT sync_job_sp")
+                        self.conn.execute("RELEASE SAVEPOINT sync_job_sp")
+                    except Exception:
+                        self.conn.rollback()
+                        raise
+                    logger.error(
+                        "ROLLBACK SAVEPOINT sync_job_sp — création du job de sync "
+                        "impossible (group_id=%s post_id=%s, %s) : %s",
+                        group_id, pid, datetime.now(timezone.utc).isoformat(), exc,
                     )
-                    thread.start()
-                    synced_ids.append(pid)
-                except Exception:
                     failed_ids.append(pid)
+                    continue
+                else:
+                    self.conn.execute(f"RELEASE SAVEPOINT sync_job_sp")
+                job_id = job["sync_job_id"]
+                try:
+                    # Exécution bornée : le job passe par l'executor commun
+                    # (threads <= SYNC_MAX_WORKERS, connexions via le pool
+                    # dédié gesto-sync) au lieu d'un thread brute.
+                    sync_executor.submit(pid, job_id)
+                except Exception as exc:
+                    # Le job existe mais ne tournera jamais : le marquer en échec
+                    # évite un job orphelin de plus, et le rendre visible.
+                    sync_svc.mark_job_failed(
+                        job_id,
+                        f"Échec de la soumission à l'executor de sync (group_id={group_id}) : {exc}",
+                    )
+                    logger.error(
+                        "Soumission à l'executor de sync impossible (group_id=%s post_id=%s "
+                        "job_id=%s, %s) : %s",
+                        group_id, pid, job_id, datetime.now(timezone.utc).isoformat(), exc,
+                    )
+                    failed_ids.append(pid)
+                    continue
+                synced_ids.append(pid)
 
         return {
             "group_id": group_id,

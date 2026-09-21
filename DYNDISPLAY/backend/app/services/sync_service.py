@@ -17,6 +17,11 @@ DEFAULT_AFFLUENCE_START_HOUR = 8
 DEFAULT_AFFLUENCE_END_HOUR = 17
 DEFAULT_LARGE_MEDIA_THRESHOLD_MB = 20
 
+# Délai au-delà duquel un job PENDING (ou un SCHEDULED dont l'échéance est
+# dépassée) est considéré orphelin : jamais pris en charge par un worker.
+# Ajustable via l'argument ``delay`` de ``recover_orphan_jobs()``.
+ORPHAN_JOB_TIMEOUT = timedelta(minutes=30)
+
 
 class SyncService:
     def __init__(self, conn: Connection):
@@ -50,9 +55,11 @@ class SyncService:
                 ).fetchone()
             except psycopg.errors.UndefinedColumn:
                 logger.warning(
-                    "sync_jobs.sync_profile_id manquante : exécuter la migration "
-                    "009_add_sync_profile_to_jobs.sql"
+                    "sync_jobs.sync_profile_id manquante (post_id=%s) : exécuter la "
+                    "migration 009_add_sync_profile_to_jobs.sql",
+                    post_id,
                 )
+                self.conn.rollback()
         return self.conn.execute(
             """
             INSERT INTO sync_jobs (post_id, status, scheduled_at)
@@ -130,6 +137,111 @@ class SyncService:
 
     def mark_job_pending(self, job_id: int) -> None:
         self._update_job(job_id, status="PENDING", scheduled_at=None)
+
+    def mark_job_failed(self, job_id: int, error_message: str) -> None:
+        self._update_job(
+            job_id,
+            status="FAILED",
+            error_message=str(error_message)[:1000],
+            completed_at=datetime.now(timezone.utc),
+        )
+
+    def find_orphan_jobs(self, delay: timedelta | None = None) -> list[dict]:
+        """Liste les jobs de synchronisation orphelins.
+
+        Un job est orphelin quand aucun worker ne l'a jamais pris en charge :
+          - status PENDING depuis plus de ``delay`` (créé en attente immédiate,
+            jamais exécuté après la mort d'un worker), ou
+          - status SCHEDULED dont l'échéance (scheduled_at) est dépassée depuis
+            plus de ``delay`` (jamais promu par le scheduler).
+        Retourne les lignes brutes (aucun effet de bord).
+        """
+        if delay is None:
+            delay = ORPHAN_JOB_TIMEOUT
+        cutoff = datetime.now(timezone.utc) - delay
+        return self.conn.execute(
+            """
+            SELECT j.sync_job_id, j.post_id, j.status, j.created_at, j.scheduled_at
+            FROM sync_jobs j
+            WHERE (j.status = 'PENDING' AND j.created_at < %s)
+               OR (j.status = 'SCHEDULED' AND j.scheduled_at IS NOT NULL
+                   AND j.scheduled_at < %s)
+            ORDER BY j.created_at
+            """,
+            (cutoff, cutoff),
+        ).fetchall()
+
+    def recover_orphan_jobs(
+        self,
+        delay: timedelta | None = None,
+        exclude_job_ids: set[int] | None = None,
+    ) -> int:
+        """Traite les jobs orphelins détectés (stratégie : marquer FAILED).
+
+        Stratégie choisie — marquer en FAILED avec un message explicite plutôt
+        que relancer automatiquement :
+          - jamais de boucle de relance ni de re-upload compétitif de médias quand
+            le worker est tombé ou que l'environnement (réseau/SFTP) est défaillant ;
+          - l'état devient honnête et visible (statut FAILED + message dans
+            l'historique des jobs, erreur claire dans les logs) ;
+          - la relance reste une décision humaine via l'API de sync existante
+            (POST /posts/{id}/sync) ou automatique via schedule_auto_syncs()
+            qui recrée un job SCHEDULED le jour suivant (mécanisme séparé).
+
+        ``exclude_job_ids`` : jobs à ne PAS traiter. Le scheduler passe les
+        jobs actuellement en file/en cours dans l'executor borné (concurrence
+        bornée) pour qu'un job qui attend légitimement sa place ne soit pas
+        faussement marqué FAILED avant d'avoir eu sa chance d'exécution.
+
+        Un poste dont un autre job est encore PENDING/RUNNING (worker actif) est
+        ignoré. Idempotent : les jobs traités passent en FAILED et ne sont plus
+        sélectionnés. Retourne le nombre de jobs récupérés.
+        """
+        if delay is None:
+            delay = ORPHAN_JOB_TIMEOUT
+        now = datetime.now(timezone.utc)
+        orphans = self.find_orphan_jobs(delay)
+        recovered = 0
+        for job in orphans:
+            if exclude_job_ids and job["sync_job_id"] in exclude_job_ids:
+                continue
+            concurrent = self.conn.execute(
+                """
+                SELECT 1 FROM sync_jobs
+                WHERE post_id = %s AND sync_job_id != %s
+                  AND status IN ('PENDING', 'RUNNING')
+                LIMIT 1
+                """,
+                (job["post_id"], job["sync_job_id"]),
+            ).fetchone()
+            if concurrent:
+                continue
+            anchor = job["scheduled_at"] if job["status"] == "SCHEDULED" else job["created_at"]
+            age_min = int((now - anchor).total_seconds() // 60)
+            message = (
+                f"Job orphelin : jamais pris en charge par un worker dans le délai de "
+                f"{int(delay.total_seconds() // 60)} min (statut {job['status']}, "
+                f"en attente depuis ~{age_min} min). Relancez manuellement ou via la "
+                f"synchro auto."
+            )[:1000]
+            self.conn.execute(
+                """
+                UPDATE sync_jobs
+                SET status = 'FAILED', error_message = %s, completed_at = %s
+                WHERE sync_job_id = %s AND status IN ('PENDING', 'SCHEDULED')
+                """,
+                (message, now, job["sync_job_id"]),
+            )
+            recovered += 1
+            logger.warning(
+                "JOB ORPHELIN détecté et marqué FAILED — post_id=%s job_id=%s "
+                "statut=%s attente=~%s min, %s : %s",
+                job["post_id"], job["sync_job_id"], job["status"], age_min,
+                datetime.now(timezone.utc).isoformat(), message,
+            )
+        if recovered:
+            self.conn.commit()
+        return recovered
 
     def generate_config(self, post_id: int) -> dict:
         post = self.conn.execute(
@@ -417,6 +529,10 @@ class SyncService:
                         self._update_item(item_id, status="COMPLETED", progress_percent=100)
                         self._update_job(job_id, progress_percent=min(progress, 99), transfer_speed=speed)
                     except Exception as e:
+                        logger.warning(
+                            "Média en échec SFTP (job %s, post %s, %s, %s) : %s",
+                            job_id, post_id, item_id, mf["remote_path"], e,
+                        )
                         self._update_item(item_id, status="FAILED", progress_percent=0)
                         self._update_job(job_id, transfer_speed=0)
 
@@ -457,7 +573,7 @@ class SyncService:
             try:
                 self.conn.rollback()
             except Exception:
-                pass
+                logger.debug("rollback échoué après échec de sync (job %s)", job_id)
             self._update_job(
                 job_id,
                 status="FAILED",
@@ -466,8 +582,19 @@ class SyncService:
             )
 
     def _upsert_media_sync_state(self, post_id: int, media_ids: set, status: str):
+        """Enregistre l'état de synchro par média, isolément par SAVEPOINT.
+
+        Si l'écriture échoue (ex. table media_sync_state absente car la
+        migration 008 n'est pas appliquée), on annule uniquement le SAVEPOINT :
+        le reste de la transaction (dont ``UPDATE posts SET last_sync_at``)
+        reste valide et peut être commité. Avant ce correctif, l'échec laissait
+        la transaction abattue : le commit final échouait, le job partait en
+        COMPLETED mais le poste restait ``last_sync_at = NULL`` (bug silencieux).
+        """
         now = datetime.now(timezone.utc)
+        savepoint = "media_sync_state_sp"
         for mid in media_ids:
+            self.conn.execute(f"SAVEPOINT {savepoint}")
             try:
                 self.conn.execute(
                     """
@@ -478,9 +605,20 @@ class SyncService:
                     """,
                     (mid, post_id, now, status),
                 )
-            except Exception:
-                logger.debug("media_sync_state table missing, skipping sync state update")
+            except Exception as exc:
+                try:
+                    self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                except Exception:
+                    self.conn.rollback()
+                logger.error(
+                    "ROLLBACK SAVEPOINT %s — media_sync_state indisponible "
+                    "(post_id=%s media_id=%s, %s) : %s",
+                    savepoint, post_id, mid,
+                    datetime.now(timezone.utc).isoformat(), exc,
+                )
                 break
+            else:
+                self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
 
     def get_group_media_hierarchy(self, group_id: int) -> list[dict]:
         posts = self.conn.execute(
@@ -539,8 +677,12 @@ class SyncService:
                             sync_states[mid] = {"status": info["latest_status"], "synced_at": None}
                     else:
                         sync_states[mid] = {"status": "NOT_SYNCED", "synced_at": None}
-            except Exception:
-                logger.debug("media_sync_state table missing, returning all media as NOT_SYNCED")
+            except Exception as exc:
+                logger.warning(
+                    "media_sync_state indisponible au regroupement (group_id=%s, %s) : %s",
+                    group_id, datetime.now(timezone.utc).isoformat(), exc,
+                )
+                self.conn.rollback()
                 for mid in media_ids:
                     sync_states[mid] = {"status": "NOT_SYNCED", "synced_at": None}
         zones: dict[int, dict] = {}
@@ -591,8 +733,12 @@ class SyncService:
                 """,
                 (media_ids, post_ids),
             ).fetchall()
-        except Exception:
-            logger.debug("media_sync_state table missing, returning all media as NOT_SYNCED")
+        except Exception as exc:
+            logger.warning(
+                "media_sync_state indisponible pour le groupe (group_id=%s, %s) : %s",
+                group_id, datetime.now(timezone.utc).isoformat(), exc,
+            )
+            self.conn.rollback()
             rows = []
         result = {}
         post_count = len(post_ids)

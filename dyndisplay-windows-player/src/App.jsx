@@ -21,7 +21,7 @@ import {
   activeZones,
   fingerprint as configFingerprint,
 } from './sync/ftpClient.js';
-import { syncMediaForConfig, loadSyncedConfig, storeSyncedConfig, mediaCacheUrl } from './cache/mediaCache.js';
+import { syncMediaForConfig, loadSyncedConfig, storeSyncedConfig, mediaCacheUrl, missingMediaCount } from './cache/mediaCache.js';
 import { startHeartbeat, stopHeartbeat } from './sync/heartbeat.js';
 import SetupScreen from './screens/SetupScreen.jsx';
 import { openPdf, renderPdfPageToCanvas } from './pdf/pdfRender.js';
@@ -130,9 +130,56 @@ function PdfZone({ media, className, style, onComplete }) {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// VideoZone — UN seul élément <video> par zone, réutilisé pour chaque média
+// de la playlist. Évite de créer un WebMediaPlayer Chromium à chaque
+// changement de média (limite ~32 simultanés → erreur "too many
+// WebMediaPlayers") et libère le player au démontage.
+// ────────────────────────────────────────────────────────────────────────────
+function VideoZone({ url, mediaId, onEnded, onError, className, style }) {
+  const videoRef = useRef(null);
+  const onEndedRef = useRef(onEnded);
+  const onErrorRef = useRef(onError);
+  onEndedRef.current = onEnded;
+  onErrorRef.current = onError;
+
+  // Changement de média : on réutilise l'élément, on recharge la nouvelle source.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.pause();
+    video.src = url;
+    video.load();
+    const p = video.play();
+    if (p && typeof p.catch === 'function') p.catch(() => {});
+  }, [url, mediaId]);
+
+  // Démontage : relâche immédiatement le player Chromium.
+  useEffect(() => () => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+  }, []);
+
+  return (
+    <video
+      ref={videoRef}
+      autoPlay
+      muted
+      playsInline
+      className="zone-media"
+      style={style}
+      onEnded={() => onEndedRef.current?.()}
+      onError={() => onErrorRef.current?.()}
+    />
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // ZoneSlideshow — playlist indépendante par zone.
 // ────────────────────────────────────────────────────────────────────────────
-function ZoneSlideshow({ zone, zoneNumber, zoneStyle, overlays, loopEnabled }) {
+function ZoneSlideshow({ zone, zoneNumber, zoneStyle, overlays, loopEnabled, onNeedMedia }) {
   const playlist = useMemo(
     () =>
       (zone?.media_playlist || (zone?.media ? [zone.media] : []))
@@ -142,9 +189,12 @@ function ZoneSlideshow({ zone, zoneNumber, zoneStyle, overlays, loopEnabled }) {
   );
 
   const [currentIndex, setCurrentIndex] = useState(0);
+  const [mediaAvailable, setMediaAvailable] = useState(true);
   const currentIndexRef = useRef(0);
   const timerRef = useRef(null);
   const playlistKey = playlist.map((m) => m.media_id).join(',');
+  const onNeedMediaRef = useRef(onNeedMedia);
+  onNeedMediaRef.current = onNeedMedia;
 
   const clearTimer = useCallback(() => {
     if (timerRef.current) {
@@ -176,19 +226,59 @@ function ZoneSlideshow({ zone, zoneNumber, zoneStyle, overlays, loopEnabled }) {
 
   const current = playlist[currentIndex] || null;
 
+  // Vérifie que le fichier du média est présent en cache avant de monter
+  // <img>/<video>/. Un média absent ne crée pas de WebMediaPlayer (sinon
+  // Chromium bloque après ~32 players) et déclenche une re-synchronisation.
+  useEffect(() => {
+    if (!current) { setMediaAvailable(true); return; }
+    let cancelled = false;
+    let iv = null;
+    const check = async () => {
+      try {
+        const ok = await window.dyndisplay?.cache?.mediaExists?.(current.filename);
+        return ok === true;
+      } catch (err) {
+        return true; // pont indisponible → on tente l'affichage quand même.
+      }
+    };
+    (async () => {
+      try {
+        const avail = await check();
+        if (cancelled) return;
+        setMediaAvailable(avail);
+        if (avail) return;
+        try { onNeedMediaRef.current?.(current.filename); } catch (err) { /* ignore */ }
+        // Re-test toutes les 5 s : dès que le fichier est téléchargé, on affiche.
+        iv = setInterval(() => {
+          if (cancelled) { clearInterval(iv); return; }
+          check()
+            .then((ok) => {
+              if (!cancelled && ok) { setMediaAvailable(true); clearInterval(iv); }
+            })
+            .catch(() => {});
+        }, 5000);
+      } catch (err) {
+        if (!cancelled) setMediaAvailable(true);
+      }
+    })();
+    return () => { cancelled = true; if (iv) clearInterval(iv); };
+  }, [current?.media_id]);
+
   useEffect(() => {
     if (!current) return;
-    if (current.media_type === 'IMAGE') {
-      const seconds = Math.max((parseInt(current.duration_seconds, 10) || 10), 3);
-      timerRef.current = setTimeout(() => {
-        timerRef.current = null;
-        const next = currentIndexRef.current + 1;
-        if (next >= playlist.length && !loopEnabled) return; // stop sur le dernier
-        advance();
-      }, seconds * 1000);
-    }
+    const isImage = current.media_type === 'IMAGE';
+    let seconds = null;
+    if (isImage) seconds = Math.max((parseInt(current.duration_seconds, 10) || 10), 3);
+    else if (!mediaAvailable) seconds = 3; // absent du cache : reprise rapide et cadrée
+    if (seconds === null) return;
+    timerRef.current = setTimeout(() => {
+      timerRef.current = null;
+      const next = currentIndexRef.current + 1;
+      if (next >= playlist.length && !loopEnabled) return; // stop sur le dernier
+      advance();
+    }, seconds * 1000);
     return clearTimer;
-  }, [currentIndex, current, playlist.length, loopEnabled, advance, clearTimer]);
+  }, [currentIndex, current, mediaAvailable, playlist.length, loopEnabled, advance, clearTimer]);
 
   if (!playlist.length) {
     return (
@@ -211,18 +301,32 @@ function ZoneSlideshow({ zone, zoneNumber, zoneStyle, overlays, loopEnabled }) {
   const isVideo = current.media_type === 'VIDEO';
   const isPdf = current.media_type === 'PDF';
 
+  if (!mediaAvailable) {
+    return (
+      <div className="zone" style={zoneStyle}>
+        <div className="zone-pdf-placeholder">{current.media_type} (téléchargement…)</div>
+        {overlays && playlist.length > 1 && (
+          <span className="zone-badge zone-badge-left">
+            {((currentIndex % playlist.length) + 1)}/{playlist.length}
+          </span>
+        )}
+        {overlays && (
+          <span className="zone-badge zone-badge-right">Z-{zoneNumber}</span>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div className="zone" style={zoneStyle}>
       {isVideo ? (
-        <video
-          key={`v-${zoneNumber}-${current.media_id}`}
-          src={mediaUrl}
-          autoPlay
-          muted
-          playsInline
-          className="zone-media"
+        <VideoZone
+          key={`v-${zoneNumber}`}
+          url={mediaUrl}
+          mediaId={current.media_id}
           onEnded={advance}
           onError={advance}
+          className="zone-media"
         />
       ) : isPdf ? (
         <PdfZone
@@ -320,7 +424,10 @@ export default function App() {
       }
       const conn = buildConn(cfg);
       await storeSyncedConfig(res.config);
-      if (res.changed) {
+      // Re-synchronise les médias si la config a changé OU si des fichiers
+      // référencés manquent encore en cache (sync précédent partiellement échoué).
+      const missing = await missingMediaCount(res.config);
+      if (res.changed || missing > 0) {
         const stats = await syncMediaForConfig(conn, cfg.postCode.trim(), res.config);
         fingerprintRef.current = res.fingerprint;
         setConfig(res.config);
@@ -328,7 +435,7 @@ export default function App() {
           ...s,
           sync: {
             ok: true,
-            detail: `Config ${res.config.code} — ${stats.downloaded} téléchargé(s), ${stats.uptodate} à jour, ${stats.failed} échec(s)`,
+            detail: `Config ${res.config.code} — ${stats.downloaded} téléchargé(s), ${stats.uptodate} à jour, ${stats.failed} échec(s)${missing > 0 ? ` (${missing} manquant(s))` : ''}`,
           },
         }));
         return { ok: true, changed: true, stats };
@@ -388,6 +495,16 @@ export default function App() {
       setSettingsOpen(true);
     });
   }, []);
+
+  // Re-sync immédiate (mais cadencée) quand un média manque en cache.
+  const lastNeedSyncRef = useRef(0);
+  const onNeedMedia = useCallback(() => {
+    const now = Date.now();
+    if (now - lastNeedSyncRef.current > 8000) {
+      lastNeedSyncRef.current = now;
+      runSync();
+    }
+  }, [runSync]);
 
   // ── Persistance des préférences d'affichage ───────────────────────────────
   useEffect(() => {
@@ -469,6 +586,7 @@ export default function App() {
                 zoneStyle={zoneStyle}
                 overlays={overlays}
                 loopEnabled={config?.loop_enabled !== false}
+                onNeedMedia={onNeedMedia}
               />
             );
           })}

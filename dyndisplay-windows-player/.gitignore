@@ -3,3 +3,6 @@ dist/
 release/
 *.log
 .DS_Store
+
+# Fichiers de test contenant des identifiants de connexion locaux
+TEST_MANUEL.md

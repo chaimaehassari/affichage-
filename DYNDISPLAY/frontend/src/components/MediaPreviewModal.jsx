@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { X, Download, Film, Image as ImageIcon, Calendar, HardDrive, FileType, AlertCircle } from 'lucide-react';
 import { getMediaById } from '../services/sites';
 import apiService, { extractDetailMessage } from '../services/api';
+import useSignedMediaUrl from '../hooks/useSignedMediaUrl';
 
 function formatSize(bytes) {
   if (!bytes) return '—';
@@ -48,7 +49,8 @@ export default function MediaPreviewModal({ mediaId, onClose }) {
     return () => window.removeEventListener('keydown', handleKey);
   }, [onClose]);
 
-  const fileUrl = media?.sftp_path ? apiService.mediaUrl(media.sftp_path) : null;
+  const sftpPath = media?.sftp_path || null;
+  const fileUrl = useSignedMediaUrl(sftpPath);
   const isVideo = media?.media_type === 'VIDEO';
   const isImage = media?.media_type === 'IMAGE';
 

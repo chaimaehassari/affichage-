@@ -21,6 +21,13 @@ Navigateur
    └──▶ SFTP / OpenSSH (stockage des médias + synchronisation players)
 ```
 
+### Accès base de données — décision d'architecture
+
+Ce projet utilise **psycopg 3** directement pour l'accès PostgreSQL. **Aucun ORM
+(SQLAlchemy, etc.) n'est utilisé ni ne doit être introduit** — toutes les requêtes sont
+écrites en SQL explicite via `psycopg_pool.ConnectionPool` (`backend/app/db/database.py`).
+Voir `backend/ARCHITECTURE.md` pour le détail et les garde-fous de revue.
+
 ## Stack Technique
 
 | Couche | Technologie |

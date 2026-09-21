@@ -33,9 +33,25 @@ def connect_new() -> Connection:
 
 pool = ConnectionPool(
     conninfo=_build_url(),
-    kwargs={"row_factory": dict_row},
+    kwargs={"row_factory": dict_row, "application_name": "gesto-api"},
     min_size=1,
     max_size=10,
+    open=False,
+)
+
+# Pool dédié aux threads de synchro : chaque worker du sync-executor prend
+# sa connexion ICI (jamais une connexion brute hors pool). Sa taille est
+# égale à SYNC_MAX_WORKERS : le nombre de connexions DB simultanées de la
+# sync est donc borné de bout en bout (threads ET connexions), et l'API web
+# (pool « gesto-api ») n'est jamais privée de ses connexions par l'orage
+# d'auto-sync. application_name = "gesto-sync" permet de suivre la conso
+# réelle dans pg_stat_activity.
+_sync_max_workers = max(int(settings.SYNC_MAX_WORKERS or 8), 1)
+sync_pool = ConnectionPool(
+    conninfo=_build_url(),
+    kwargs={"row_factory": dict_row, "application_name": "gesto-sync"},
+    min_size=0,
+    max_size=_sync_max_workers,
     open=False,
 )
 
@@ -43,9 +59,13 @@ pool = ConnectionPool(
 def init_db() -> None:
     if pool.closed:
         pool.open()
+    if sync_pool.closed:
+        sync_pool.open()
 
 
 def close_db() -> None:
+    if not sync_pool.closed:
+        sync_pool.close()
     if not pool.closed:
         pool.close()
 
@@ -54,6 +74,13 @@ def get_connection() -> Connection:
     if pool.closed:
         pool.open()
     return pool.connection(timeout=30)
+
+
+def get_sync_connection() -> Connection:
+    """Connexion issue du pool sync (borné), pour les workers de synchro."""
+    if sync_pool.closed:
+        sync_pool.open()
+    return sync_pool.connection(timeout=60)
 
 
 def get_db():

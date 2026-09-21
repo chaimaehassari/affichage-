@@ -1,3 +1,6 @@
+# Accès PostgreSQL : psycopg 3 (psycopg[binary]) + psycopg-pool UNIQUEMENT.
+# Ne pas ajouter d'ORM ici (SQLAlchemy, Alembic, Tortoise, Peewee, SQLModel…).
+# Ce projet est en SQL brut + ConnectionPool — voir backend/ARCHITECTURE.md.
 fastapi>=0.115.0
 uvicorn[standard]>=0.34.0
 psycopg[binary]>=3.2.3

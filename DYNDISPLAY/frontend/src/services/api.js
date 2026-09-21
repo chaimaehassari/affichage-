@@ -36,16 +36,25 @@ class ApiService {
     localStorage.removeItem('dyndisplay_token');
   }
 
-  mediaUrl(sftpPath) {
-    return this.withMediaToken(`${this.baseUrl}/media/${sftpPath}`);
+  // Émet un token MÉDIA court vécu et scopé au fichier demandé (typ=media).
+  // Ce token est inutilisable comme session : le token de session ne circule
+  // jamais dans une URL (il n'est envoyé que dans l'en-tête Authorization).
+  async getMediaToken(path) {
+    const res = await this.post('/api/v1/media-token', { path });
+    if (!res.ok || !res.data || !res.data.token) return null;
+    return res.data.token;
   }
 
-  withMediaToken(url) {
-    if (!url) return url;
-    const token = this.getToken();
-    if (!token) return url;
-    const sep = url.includes('?') ? '&' : '?';
-    return `${url}${sep}token=${encodeURIComponent(token)}`;
+  // Construit l'URL signée d'un média (aperçus <img>/<video>/<a>).
+  // Accepte un chemin nu (`sftp_path`) ou une URL complète `/media/<path>`.
+  // Async : le jeton est minté à la demande, puis mis en cache côté rendu.
+  async mediaUrl(pathLike) {
+    if (!pathLike) return null;
+    const p = String(pathLike).replace(/^\/media\//, '').replace(/^\/+/, '');
+    if (!p) return null;
+    const token = await this.getMediaToken(p);
+    if (!token) return null;
+    return `${this.baseUrl}/media/${p}?token=${encodeURIComponent(token)}`;
   }
 
   async request(endpoint, options = {}) {

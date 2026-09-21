@@ -6,11 +6,12 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from psycopg import Connection
 
-from app.db.database import get_db, connect_new
+from app.db.database import get_db, get_sync_connection
 from app.dependencies.auth import require_permission
 from app.schemas.sync import SyncJobOut, SyncJobCreate
 from app.services.sync_service import SyncService
 from app.services.scope import assert_group_access, assert_post_scope
+from app.services.sync_executor import sync_executor
 from app.core.times import to_utc
 
 logger = logging.getLogger(__name__)
@@ -94,20 +95,29 @@ def start_sync(
     job = service.create_job(post_id, scheduled_at)
     job_id = job["sync_job_id"]
 
+    # Le commit DOIT précéder la soumission à l'executor : le get_db ne commit
+    # qu'en fin de requête, or le worker lit le job sur SA connexion (pool
+    # gesto-sync) — un INSERT non committé est invisible (READ COMMITTED) et
+    # run_sync sortirait avec « Job not found » (succès fantôme, PENDING figé).
+    db.commit()
+
     if scheduled_at is None:
-        thread = threading.Thread(target=_run_sync_task, args=(post_id, job_id), daemon=True)
-        thread.start()
+        sync_executor.submit(post_id, job_id)
 
     return _job_out(job, [])
 
 
-def _run_sync_task(post_id: int, job_id: int, media_ids: list[int] | None = None):
-    try:
-        with connect_new() as conn:
-            service = SyncService(conn)
-            service.run_sync(post_id, job_id, media_ids=media_ids)
-    except Exception as e:
-        logger.error(f"Sync thread failed for job {job_id}: {e}", exc_info=True)
+@router.get("/sync/load")
+def get_sync_load(
+    current_user=Depends(require_permission("menu_sync")),
+):
+    """État de la file de sync : workers occupés, file d'attente, cumuls.
+
+    Rend un pic de charge visible AVANT qu'il ne devienne un incident :
+    quand ``queued`` reste élevé longtemps (ou que ``failed`` monte), c'est
+    le signe d'une vague d'auto-sync supérieure à la capacité.
+    """
+    return sync_executor.snapshot()
 
 
 @router.get("/sync-jobs/{job_id}", response_model=SyncJobOut)
@@ -181,16 +191,21 @@ def sync_group(
         raise HTTPException(status_code=400, detail="Le groupe ne contient aucun poste.")
 
     results = []
+    submitted = []
     for pid in post_ids:
         running = service.check_running_sync(pid)
         if running:
             results.append({"post_id": pid, "status": "SKIPPED", "detail": "Déjà en cours."})
             continue
         job = service.create_job(pid, None)
-        job_id = job["sync_job_id"]
-        thread = threading.Thread(target=_run_sync_task, args=(pid, job_id), daemon=True)
-        thread.start()
-        results.append({"post_id": pid, "status": "STARTED", "sync_job_id": job_id})
+        submitted.append((pid, job["sync_job_id"]))
+        results.append({"post_id": pid, "status": "STARTED", "sync_job_id": job["sync_job_id"]})
+
+    # Commit avant soumission (voir start_sync) : les workers doivent voir les
+    # lignes sync_jobs créées, sinon succès fantôme.
+    db.commit()
+    for pid, job_id in submitted:
+        sync_executor.submit(pid, job_id)
 
     return {"group_id": group_id, "results": results}
 
@@ -291,6 +306,7 @@ def sync_group_media(
         pass
 
     results = []
+    submitted = []
     for pid in post_ids:
         running = service.check_running_sync(pid)
         if running:
@@ -309,12 +325,17 @@ def sync_group_media(
                 pass
             break
         job = service.create_job(pid, None)
-        job_id = job["sync_job_id"]
-        thread = threading.Thread(
-            target=_run_sync_task, args=(pid, job_id, [media_id]), daemon=True
-        )
-        thread.start()
-        results.append({"post_id": pid, "status": "STARTED", "sync_job_id": job_id})
+        submitted.append((pid, job["sync_job_id"]))
+        results.append({"post_id": pid, "status": "STARTED", "sync_job_id": job["sync_job_id"]})
+
+    # Commit avant soumission (voir start_sync) : les workers doivent voir les
+    # lignes sync_jobs créées, sinon succès fantôme.
+    try:
+        db.commit()
+    except Exception:
+        pass
+    for pid, job_id in submitted:
+        sync_executor.submit(pid, job_id, [media_id])
 
     return {"group_id": group_id, "media_id": media_id, "results": results}
 
@@ -334,10 +355,32 @@ def get_config_preview(
     return config
 
 
+_last_load_log = 0.0
+
+
+def _log_sync_load(submitted: int) -> None:
+    """Log périodique (max 1/60 s) de l'état de la file, quand elle n'est pas vide."""
+    global _last_load_log
+    stats = sync_executor.snapshot()
+    if submitted == 0 and stats["running"] == 0 and stats["queued"] == 0:
+        return
+    now = time.monotonic()
+    if now - _last_load_log < 60.0:
+        return
+    _last_load_log = now
+    logger.warning(
+        "Scheduler : charge de sync — running=%s queued=%s max_workers=%s "
+        "(soumis ce cycle=%s, total soumis=%s, terminés=%s, échecs=%s, pic file=%s)",
+        stats["running"], stats["queued"], stats["max_workers"],
+        submitted, stats["submitted_total"], stats["completed"],
+        stats["failed"], stats["queue_peak"],
+    )
+
+
 def _scheduler_loop():
     while True:
         try:
-            with connect_new() as conn:
+            with get_sync_connection() as conn:
                 service = SyncService(conn)
                 try:
                     # Création des jobs programmés (synchro en différé) :
@@ -346,16 +389,37 @@ def _scheduler_loop():
                 except Exception as e:
                     logger.error(f"Auto-sync scheduling error: {e}", exc_info=True)
                 due = service.get_due_scheduled_jobs()
+                submitted = 0
                 for job in due:
                     post_id = job["post_id"]
                     job_id = job["sync_job_id"]
                     if service.check_running_sync(post_id):
                         continue
                     service.mark_job_pending(job_id)
-                    thread = threading.Thread(
-                        target=_run_sync_task, args=(post_id, job_id), daemon=True
+                    # Exécution bornée : au-delà de SYNC_MAX_WORKERS, le job
+                    # attend dans la file de l'executor (il reste PENDING et
+                    # sera exclu de la reprise des orphelins en 3.).
+                    sync_executor.submit(post_id, job_id)
+                    submitted += 1
+                try:
+                    # Reprise des jobs orphelins : les jobs jamais pris en charge
+                    # par un worker (PENDING échoué, SCHEDULED non promu) sont
+                    # marqués FAILED avec un message explicite. Log clairement
+                    # visible quand un incident similaire se reproduit.
+                    # Exclusion : les jobs en file/en cours dans l'executor
+                    # borné ne sont PAS des orphelins (on ne les marque pas
+                    # FAILED avant leur tour).
+                    recovered = service.recover_orphan_jobs(
+                        exclude_job_ids=sync_executor.active_job_ids()
                     )
-                    thread.start()
+                    if recovered:
+                        logger.warning(
+                            "Scheduler : %s job(s) orphelin(s) marqué(s) FAILED "
+                            "(see JOB ORPHELIN logs).", recovered
+                        )
+                except Exception as e:
+                    logger.error(f"Orphan-job recovery error: {e}", exc_info=True)
+                _log_sync_load(submitted)
         except Exception as e:
             logger.error(f"Sync scheduler error: {e}", exc_info=True)
         time.sleep(15)

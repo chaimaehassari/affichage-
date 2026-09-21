@@ -5,7 +5,13 @@ import { LogOut, ArrowLeft, Monitor, LayoutGrid } from 'lucide-react';
 import ThemeToggle from '../components/ThemeToggle';
 import NavBar from '../components/NavBar';
 import { getPostConfig } from '../services/display';
-import apiService, { extractDetailMessage } from '../services/api';
+import { extractDetailMessage } from '../services/api';
+import useSignedMediaUrl from '../hooks/useSignedMediaUrl';
+
+function SignedPage({ url, ...props }) {
+  const signed = useSignedMediaUrl(url);
+  return signed ? <img src={signed} {...props} /> : null;
+}
 
 function PdfZone({ media, className, style }) {
   const pages = media?.pdf_pages || [];
@@ -33,9 +39,9 @@ function PdfZone({ media, className, style }) {
   return (
     <div className={`${className} relative`} style={style}>
       {pages.map((url, i) => (
-        <img
+        <SignedPage
           key={`${media.media_id}-p${i}`}
-          src={apiService.withMediaToken(url)}
+          url={url}
           alt={`${media.name} page ${i + 1}`}
           className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-500 ${i === currentPage ? 'opacity-100' : 'opacity-0'}`}
           onError={(e) => { e.target.style.display = 'none'; }}
@@ -73,6 +79,9 @@ function ZoneSlideshow({ playlist, zoneNumber, zoneStyle, color }) {
   }, [playlist.map(m => m?.media_id).join(',')]);
 
   const validItems = playlist.filter(m => m && m.media_id);
+  const current = validItems.length ? validItems[currentIndex % validItems.length] : null;
+  const mediaUrl = useSignedMediaUrl(current?.url || null);
+
   if (!validItems.length) {
     return (
       <div className="absolute border border-white/20" style={zoneStyle}>
@@ -86,8 +95,7 @@ function ZoneSlideshow({ playlist, zoneNumber, zoneStyle, color }) {
     );
   }
 
-  const media = validItems[currentIndex % validItems.length];
-  const mediaUrl = media.url ? apiService.withMediaToken(media.url) : null;
+  const media = current;
 
   return (
     <div className="absolute border border-white/20" style={zoneStyle}>

@@ -5,11 +5,43 @@ import { LogOut, Image, Film, Trash2, Upload, HardDrive, Eye, FileText } from 'l
 import ThemeToggle from '../components/ThemeToggle';
 import NavBar from '../components/NavBar';
 import { getMedia, uploadMedia, deleteMedia } from '../services/sites';
-import apiService, { extractDetailMessage } from '../services/api';
+import { extractDetailMessage } from '../services/api';
 import MediaPreviewModal from '../components/MediaPreviewModal';
+import useSignedMediaUrl from '../hooks/useSignedMediaUrl';
 
 const ALLOWED_EXTENSIONS = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'mp4', 'avi', 'mkv', 'mov', 'webm', 'pdf'];
 const MAX_SIZE = 500 * 1024 * 1024;
+
+// Miniature média : l'URL signée est mintée (async) via useSignedMediaUrl.
+// Tant qu'elle n'est pas prête (ou hors IMAGE sans sftp_path), on affiche le
+// placeholder type de média — jamais d'URL non signée.
+function MediaThumb({ media }) {
+  const signed = useSignedMediaUrl(
+    media?.media_type === 'IMAGE' && media?.sftp_path ? media.sftp_path : null,
+  );
+  const showPlaceholder = media?.media_type !== 'IMAGE' || !media?.sftp_path || !signed;
+  return (
+    <div className="w-full h-full flex items-center justify-center">
+      {!showPlaceholder && (
+        <img
+          src={signed}
+          alt={media.name}
+          className="w-full h-full object-cover"
+          onError={(e) => { e.target.style.display = 'none'; e.target.nextSibling.style.display = 'flex'; }}
+        />
+      )}
+      <div className={`${showPlaceholder ? 'flex' : 'hidden'} flex-col items-center justify-center gap-2`}>
+        {media.media_type === 'VIDEO' ? <Film className="w-10 h-10 text-[#f6c200]/50" /> :
+         media.media_type === 'PDF' ? <FileText className="w-10 h-10 text-red-400/50" /> :
+         <Image className="w-10 h-10 text-[#a0a7b3]/50" />}
+        <span className="text-[10px] text-[#a0a7b3] uppercase font-medium">{media.file_extension}</span>
+        {media.media_type === 'PDF' && media.page_count && (
+          <span className="text-[10px] text-red-400/70">{media.page_count} page(s)</span>
+        )}
+      </div>
+    </div>
+  );
+}
 
 function formatSize(bytes) {
   if (!bytes) return '-';
@@ -113,23 +145,7 @@ export default function MediaLibrary() {
       onMouseEnter={() => setHoveredId(m.media_id)}
       onMouseLeave={() => setHoveredId(null)}>
       <div className="aspect-square bg-[#0f1217] flex items-center justify-center overflow-hidden relative">
-        {m.media_type === 'IMAGE' && m.sftp_path ? (
-          <img
-            src={apiService.mediaUrl(m.sftp_path)}
-            alt={m.name}
-            className="w-full h-full object-cover"
-            onError={(e) => { e.target.style.display = 'none'; e.target.nextSibling.style.display = 'flex'; }}
-          />
-        ) : null}
-        <div className={`${m.media_type === 'IMAGE' && m.sftp_path ? 'hidden' : 'flex'} flex-col items-center justify-center gap-2`}>
-          {m.media_type === 'VIDEO' ? <Film className="w-10 h-10 text-[#f6c200]/50" /> :
-           m.media_type === 'PDF' ? <FileText className="w-10 h-10 text-red-400/50" /> :
-           <Image className="w-10 h-10 text-[#a0a7b3]/50" />}
-          <span className="text-[10px] text-[#a0a7b3] uppercase font-medium">{m.file_extension}</span>
-          {m.media_type === 'PDF' && m.page_count && (
-            <span className="text-[10px] text-red-400/70">{m.page_count} page(s)</span>
-          )}
-        </div>
+        <MediaThumb media={m} />
 
         {hoveredId === m.media_id && (
           <div className="absolute inset-0 bg-black/60 flex items-center justify-center gap-3 transition-opacity duration-200">

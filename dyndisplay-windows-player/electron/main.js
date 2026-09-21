@@ -128,6 +128,43 @@ function buildSftp(conn, timeoutMs) {
   }).then(() => ({ sftpInstance: sftp, t }));
 }
 
+// Fermeture de connexion "best effort" : une erreur ici (ex. ECONNRESET levé par
+// le serveur pendant le teardown) ne doit JAMAIS invalider le résultat obtenu.
+async function closeSftp(sftpInstance) {
+  if (!sftpInstance) return;
+  try {
+    await sftpInstance.end();
+  } catch (err) {
+    // nettoyage uniquement — on ignore.
+  }
+}
+
+// Exécute fn(sftp) sur une connexion dédiée, avec un retry en cas d'erreur
+// réseau transitoire (ECONNRESET / END_OF_FILE / ETIMEDOUT).
+async function withSftp(conn, fn) {
+  let attempt = 0;
+  while (true) {
+    attempt += 1;
+    let sftpInstance = null;
+    try {
+      const s = await buildSftp(conn, conn.timeoutSec);
+      sftpInstance = s.sftpInstance;
+      const result = await fn(sftpInstance);
+      await closeSftp(sftpInstance);
+      return result;
+    } catch (err) {
+      await closeSftp(sftpInstance);
+      if (attempt >= 2) throw err;
+      const transient =
+        err && (err.code === 'ECONNRESET' || err.code === 'END_OF_FILE' ||
+          err.code === 'ETIMEDOUT' || err.code === 'ECONNREFUSED' ||
+          ((err.message || '').indexOf('ECONNRESET') !== -1));
+      if (!transient) throw err;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+}
+
 function getContentType(filePath) {
   const ext = path.extname(filePath).toLowerCase();
   const map = {
@@ -255,8 +292,7 @@ function registerIpc() {
   // ── SFTP ─────────────────────────────────────────────────────────────────
   ipcMain.handle('ftp:test', async (_e, conn) => {
     try {
-      const { sftpInstance, t } = await buildSftp(conn, conn.timeoutSec);
-      await sftpInstance.end();
+      await withSftp(conn, async () => {});
       return { ok: true, message: 'Connexion SFTP réussie.' };
     } catch (err) {
       return { ok: false, message: `Échec : ${err.code || err.message || err}` };
@@ -266,13 +302,8 @@ function registerIpc() {
   ipcMain.handle('ftp:stat', async (_e, payload) => {
     // payload : { conn, remotePath } → retourne stat à distance
     try {
-      const { sftpInstance } = await buildSftp(payload.conn, payload.conn.timeoutSec);
-      try {
-        const st = await sftpInstance.stat(payload.remotePath);
-        return { ok: true, size: st.size, mtimeMs: (st.mtime || 0) * 1000 };
-      } finally {
-        await sftpInstance.end();
-      }
+      const st = await withSftp(payload.conn, (sftp) => sftp.stat(payload.remotePath));
+      return { ok: true, size: st.size, mtimeMs: (st.mtime || 0) * 1000 };
     } catch (err) {
       return { ok: false, error: err.message || String(err) };
     }
@@ -284,25 +315,23 @@ function registerIpc() {
       const postCode = String(payload.postCode || '').trim();
       if (!postCode) return { ok: false, error: 'Code poste manquant.' };
       const remotePath = qualifyRemote(payload.conn?.rootPath, `players/${postCode}/config.json`);
-      const { sftpInstance } = await buildSftp(payload.conn, payload.conn.timeoutSec);
+      const result = await withSftp(payload.conn, async (sftp) => {
+        const st = await sftp.stat(remotePath);
+        const buf = await sftp.get(remotePath);
+        return { st, buf };
+      });
+      let config = null;
       try {
-        const st = await sftpInstance.stat(remotePath);
-        const buf = await sftpInstance.get(remotePath);
-        let config = null;
-        try {
-          config = JSON.parse(buf.toString('utf8'));
-        } catch (e) {
-          return { ok: false, error: 'config.json distant illisible (JSON invalide).', code: 'BAD_JSON' };
-        }
-        safeWriteJson(syncedConfigPath(), config);
-        return {
-          ok: true,
-          config,
-          remote: { size: st.size, mtimeMs: (st.mtime || 0) * 1000 },
-        };
-      } finally {
-        await sftpInstance.end();
+        config = JSON.parse(result.buf.toString('utf8'));
+      } catch (e) {
+        return { ok: false, error: 'config.json distant illisible (JSON invalide).', code: 'BAD_JSON' };
       }
+      safeWriteJson(syncedConfigPath(), config);
+      return {
+        ok: true,
+        config,
+        remote: { size: result.st.size, mtimeMs: (result.st.mtime || 0) * 1000 },
+      };
     } catch (err) {
       return { ok: false, error: err.message || String(err), code: err.code || null };
     }
@@ -319,22 +348,19 @@ function registerIpc() {
       const localPath = path.join(mediaCacheDir(), filename);
       ensureDir(path.dirname(localPath));
 
-      const { sftpInstance } = await buildSftp(payload.conn, payload.conn.timeoutSec);
-      try {
-        const st = await sftpInstance.stat(remotePath);
-        const size = st.size;
+      const size = await withSftp(payload.conn, async (sftp) => {
+        const st = await sftp.stat(remotePath);
         if (fs.existsSync(localPath)) {
           const ls = fs.statSync(localPath);
           const sameMtime = Math.abs(ls.mtimeMs - (st.mtime || 0) * 1000) < 1500;
-          if (sameMtime && ls.size === size) {
-            return { ok: true, downloaded: false, size };
+          if (sameMtime && ls.size === st.size) {
+            return { downloaded: false, existing: true, size: st.size };
           }
         }
-        await sftpInstance.get(remotePath, localPath);
-        return { ok: true, downloaded: true, size };
-      } finally {
-        await sftpInstance.end();
-      }
+        await sftp.get(remotePath, localPath);
+        return { downloaded: true, existing: false, size: st.size };
+      });
+      return { ok: true, downloaded: !size.existing, size: size.size };
     } catch (err) {
       return { ok: false, error: err.message || String(err) };
     }
