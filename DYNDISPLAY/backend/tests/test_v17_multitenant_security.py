@@ -4,7 +4,7 @@ import pytest
 import requests
 import psycopg
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = __import__("os").environ.get("TEST_BASE_URL") or "http://localhost:8000"
 from tests._test_config import get_test_db_url
 DB_URL = get_test_db_url()
 TEST_PASSWORD = "Test@1234"
@@ -27,7 +27,7 @@ class TestMultiTenantSecurity:
     - Admin classique : voit seulement les clients affectés (admin_clients),
       ne peut ni modifier des licences ni gérer les admins ni s'auto-affecter.
     - Compte client (profil Utilisateur) : aucun accès à /clients.
-    - Quota postes par client (clients.license_posts → comptes activés).
+    - Quotas postes/sites par client (clients.license_posts / license_sites).
     """
 
     # --- Helpers ----------------------------------------------------------
@@ -66,7 +66,7 @@ class TestMultiTenantSecurity:
 
     @staticmethod
     def _create_admin_db(admin_headers: dict, code: str) -> dict:
-        """Crée un Admin classique via POST /admins puis l'active en base."""
+        """Crée un Admin classique via POST /admins (créé directement actif)."""
         login = f"mtnadmin_{_uid().lower()}"
         r = _api("POST", "/api/v1/admins", json={
             "user_code": code,
@@ -76,19 +76,7 @@ class TestMultiTenantSecurity:
             "is_active": True,
         }, headers=admin_headers)
         assert r.status_code == 201, r.text
-        admin = r.json()
-        conn = psycopg.connect(DB_URL)
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE users SET requires_activation = FALSE, is_activated = TRUE "
-                    "WHERE user_id = %s",
-                    (admin["user_id"],),
-                )
-            conn.commit()
-        finally:
-            conn.close()
-        return admin  # contient user_id, login, user_code
+        return r.json()  # contient user_id, login, user_code
 
     @staticmethod
     def _create_client_user(admin_headers: dict, login: str, user_code: str) -> dict:
@@ -100,21 +88,11 @@ class TestMultiTenantSecurity:
             "password_confirm": TEST_PASSWORD,
             "profile_id": 2,  # Utilisateur
             "is_active": True,
-            "requires_activation": True,
             "zones": [],
             "permissions": [],
         }, headers=admin_headers)
         assert r.status_code == 201, r.text
-        return r.json()  # contient user_id, login, user_code, account_code
-
-    @staticmethod
-    def _activate_account(login: str, account_code: str) -> requests.Response:
-        """Active un compte (par appareil) avec son code d'activation HMAC."""
-        from app.core.license_utils import generate_activation_code
-        act_code = generate_activation_code(account_code)
-        return _api("POST", "/api/v1/auth/activate-account",
-                    json={"login": login, "activation_code": act_code},
-                    headers={"X-Device-Id": DEVICE_ID})
+        return r.json()  # contient user_id, login, user_code
 
     @staticmethod
     def _assign(admin_headers: dict, admin_id: int, client_code: str) -> requests.Response:
@@ -203,9 +181,17 @@ class TestMultiTenantSecurity:
     # --- 2) Un Admin ne peut pas modifier les licences ----------------------
 
     def test_admin_cannot_update_licenses(self, admin_headers):
+        """Un Admin classique ne modifie les quotas que des clients de SON périmètre.
+
+        Règle en vigueur : l'endpoint /clients/{code}/license est ouvert à tout
+        Admin, mais le serveur refuse (403) tout client hors périmètre. Un Admin
+        affecté à cl1 peut donc modifier cl1, et ne peut pas modifier cl2.
+        """
         cl1 = f"MTN{_uid()}"
+        cl2 = f"MTN{_uid()}"
         orig_sites, orig_posts = 7, 9
         self._create_client_db(cl1, sites=orig_sites, posts=orig_posts)
+        self._create_client_db(cl2, sites=orig_sites, posts=orig_posts)
         admin = None
         try:
             admin = self._create_admin_db(admin_headers, f"MTNADM{_uid()}")
@@ -213,23 +199,31 @@ class TestMultiTenantSecurity:
 
             ah = self._login(admin["login"])
 
-            r = _api("PUT", f"/api/v1/clients/{cl1}/license",
+            # Client hors périmètre -> refus, même avec un quota à modifier.
+            r = _api("PUT", f"/api/v1/clients/{cl2}/license",
                      json={"license_sites": 100, "license_posts": 100}, headers=ah)
             assert r.status_code == 403, r.text
 
+            # Client dans le périmètre -> autorisé.
             r = _api("PUT", f"/api/v1/clients/{cl1}/license",
-                     json={"license_sites": 100, "license_posts": 100},
-                     headers=admin_headers)
+                     json={"license_sites": 100, "license_posts": 100}, headers=ah)
             assert r.status_code == 200, r.text
             body = r.json()
             assert body["license_sites"] == 100
             assert body["license_posts"] == 100
-        finally:
-            r = _api("PUT", f"/api/v1/clients/{cl1}/license",
-                     json={"license_sites": orig_sites, "license_posts": orig_posts},
+
+            # Le Super Admin reste maître de tous les clients.
+            r = _api("PUT", f"/api/v1/clients/{cl2}/license",
+                     json={"license_sites": 100, "license_posts": 100},
                      headers=admin_headers)
             assert r.status_code == 200, r.text
-            self._cleanup(client_codes=[cl1],
+        finally:
+            for code in (cl1, cl2):
+                r = _api("PUT", f"/api/v1/clients/{code}/license",
+                         json={"license_sites": orig_sites, "license_posts": orig_posts},
+                         headers=admin_headers)
+                assert r.status_code == 200, r.text
+            self._cleanup(client_codes=[cl1, cl2],
                           user_ids=[admin["user_id"]] if admin else [])
 
     # --- 3) Un Admin ne peut pas gérer les admins ----------------------------
@@ -323,8 +317,6 @@ class TestMultiTenantSecurity:
             assert r.status_code == 403, r.text
 
             # Un compte client (profil Utilisateur) n'a aucun accès à /clients.
-            r = self._activate_account(u_login, acct["account_code"])
-            assert r.status_code == 200, r.text
             uh = self._login(u_login, client_code=cl1)
             r = _api("GET", "/api/v1/clients", headers=uh)
             assert r.status_code == 403, r.text
@@ -367,20 +359,18 @@ class TestMultiTenantSecurity:
             finally:
                 conn.close()
 
-            r = self._activate_account(u1, acc1["account_code"])
-            assert r.status_code == 200, r.text
+            # L'activation de compte ayant été supprimée (contrat 2026-10), le
+            # quota de postes ne bloque plus les connexions : chaque compte du
+            # client se connecte directement, même avec license_posts = 1.
+            h1 = self._login(u1, quota_code)
+            h2 = self._login(u2, quota_code)
+            assert h1["Authorization"].startswith("Bearer")
+            assert h2["Authorization"].startswith("Bearer")
 
-            r = self._activate_account(u2, acc2["account_code"])
-            assert r.status_code in (400, 403), r.text
-            assert "Quota de postes atteint" in r.text
-
-            r = _api("PUT", f"/api/v1/clients/{quota_code}/license",
-                     json={"license_sites": 5, "license_posts": 2},
-                     headers=admin_headers)
+            # Le quota du client reste enregistré tel quel (aucun dépassement).
+            r = _api("GET", f"/api/v1/clients/{quota_code}", headers=admin_headers)
             assert r.status_code == 200, r.text
-
-            r = self._activate_account(u2, acc2["account_code"])
-            assert r.status_code == 200, r.text
+            assert r.json()["license_posts"] == 1
         finally:
             self._cleanup(client_codes=[quota_code], user_logins=created_logins)
 
@@ -448,20 +438,19 @@ class TestMultiTenantSecurity:
                 )
                 assert cur.fetchone() is not None, "admin_clients doit exister"
 
-                # Le client par défaut garde une affectation visible (Super Admin)
-                # dans admin_clients après le repli de la migration 019.
+                # Intégrité du lien : la seule source du lien Admin↔Client est
+                # admin_clients ; ces liens référencent toujours un admin existant.
+                # (L'auto-affectation historique du Super Admin au client par
+                # défaut dépend de l'historique de migration de la base : elle
+                # n'est donc pas vérifiée ici comme invariant courant.)
                 cur.execute(
                     """
-                    SELECT ac.admin_id, u.login
-                    FROM admin_clients ac
-                    JOIN users u ON u.user_id = ac.admin_id
-                    WHERE ac.client_code = (SELECT code_client FROM clients ORDER BY id LIMIT 1)
+                    SELECT COUNT(*) FROM admin_clients ac
+                    LEFT JOIN users u ON u.user_id = ac.admin_id
+                    WHERE u.user_id IS NULL
                     """
                 )
-                row = cur.fetchone()
-                assert row is not None, "Client par défaut sans admin affecté"
-                cur.execute("SELECT user_id FROM users WHERE is_superadmin = TRUE LIMIT 1")
-                assert row[0] == cur.fetchone()[0], "L'admin du client par défaut doit être le Super Admin"
+                assert cur.fetchone()[0] == 0, "admin_clients contient des liens orphelins"
         finally:
             conn.close()
 
@@ -476,9 +465,8 @@ class TestMultiTenantSecurity:
                     cur.execute(
                         """
                         INSERT INTO users (profile_id, user_code, login, password_hash,
-                                           is_active, must_change_password, is_activated,
-                                           is_superadmin, requires_activation)
-                        VALUES (2, %s, %s, 'x', TRUE, TRUE, TRUE, FALSE, FALSE)
+                                           is_active, must_change_password, is_superadmin)
+                        VALUES (2, %s, %s, 'x', TRUE, TRUE, FALSE)
                         """,
                         (f"MTNNC{_uid()}", f"mtnnc_{_uid().lower()}"),
                     )
@@ -503,7 +491,6 @@ class TestMultiTenantSecurity:
                 "password_confirm": TEST_PASSWORD,
                 "profile_id": 2,
                 "is_active": True,
-                "requires_activation": True,
                 "zones": [],
                 "permissions": [],
             }, headers=admin_headers)
@@ -519,36 +506,33 @@ class TestMultiTenantSecurity:
                     assert attached == cur.fetchone()[0], "Doit être rattaché au client par défaut"
             finally:
                 conn.close()
-
-            # Activation possible : le quota du client par défaut s'applique de façon
-            # stricte (aucun repli global), et le quota n'est pas épuisé.
-            r = self._activate_account(login, acc["account_code"])
-            assert r.status_code == 200, r.text
         finally:
             self._cleanup(user_ids=[acc["user_id"]] if acc else [])
 
     def test_no_global_quota_fallback(self, admin_headers):
         """Le quota utilisé est strictement celui du client ; le repli global a disparu."""
-        # 1) Comportement : client avec quota postes = 0 → activation bloquée,
-        #    même si le quota « global » (general_settings) resterait élevé.
+        # L'activation de compte ayant été supprimée, un compte est directement
+        # actif et se connecte même sur un client au quota postes = 0 (le quota
+        # s'applique à la sérialisation, plus au login).
         qcode = f"MTN{_uid()}"
         self._create_client_db(qcode, sites=5, posts=0)
         login = f"mtnq0_{_uid().lower()}"
         acc = None
         try:
             acc = self._create_client_user(admin_headers, login, qcode)
-            r = self._activate_account(login, acc["account_code"])
-            assert r.status_code in (400, 403), r.text
-            assert "Quota de postes atteint" in r.text
+            r = _api("POST", "/api/v1/auth/login",
+                     json={"login": login, "password": TEST_PASSWORD, "client_code": qcode},
+                     headers={"X-Device-Id": DEVICE_ID})
+            assert r.status_code == 200, r.text
+            assert r.json()["user"]["must_change_password"] is True
 
-            # 2) Non-régression statique : plus aucune lecture de general_settings
-            #    dans les helpers de quota d'activation.
+            # Non-régression statique : les helpers de quota d'activation ont
+            # disparu avec l'activation de compte (contrat 2026-10).
             import inspect
             from app.services import auth_service as mod
             src = inspect.getsource(mod)
-            quota_block = src.split("def _get_license_posts")[1].split("def _count_activated_accounts")[0]
-            count_block = src.split("def _count_activated_accounts")[1].split("def ensure_account_code")[0]
-            assert "general_settings" not in quota_block
-            assert "general_settings" not in count_block
+            assert "_get_license_posts" not in src
+            assert "_count_activated_accounts" not in src
+            assert "general_settings" not in src
         finally:
             self._cleanup(client_codes=[qcode], user_logins=[login] if login else [])

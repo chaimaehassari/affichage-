@@ -257,11 +257,46 @@ class TestJobVisibilityWait:
                 conn.commit()
 
     def test_run_sync_task_times_out_when_job_never_appears(self, monkeypatch):
+        """Job invisible alors que le POST existe : vraie anomalie → False.
+
+        Le contrat de `run_sync_task` distingue trois issues : True (sync
+        faite), False (vrai échec) et None (job annulé parce que le POST a
+        été supprimé, le job partant en CASCADE). Pour obtenir un False, le
+        poste doit donc exister : un identifiant de poste fantôme donnerait le
+        None « annulation », pas l'échec.
+        """
         from app.services import sync_executor as executor_module
 
         monkeypatch.setattr(executor_module, "JOB_COMMIT_WAIT_SECONDS", 0.2)
         monkeypatch.setattr(executor_module, "JOB_COMMIT_POLL_SECONDS", 0.01)
-        assert executor_module.run_sync_task(1, 99999999) is False
+
+        with _open() as conn:
+            cid = conn.execute("SELECT id FROM clients ORDER BY id LIMIT 1").fetchone()["id"]
+            site = conn.execute(
+                "INSERT INTO sites (code, name, client_id) VALUES (%s, %s, %s) RETURNING site_id",
+                (f"V19T_{_uid()}", f"Site V19 {_uid()}", cid),
+            ).fetchone()["site_id"]
+            p = conn.execute(
+                "INSERT INTO posts (site_id, code, name) VALUES (%s, %s, %s) RETURNING post_id",
+                (site, f"V19TP_{_uid()}", f"Post V19 {_uid()}"),
+            ).fetchone()["post_id"]
+            conn.commit()
+            try:
+                # Aucun sync_jobs pour ce post : la ligne n'existera jamais.
+                assert executor_module.run_sync_task(p, 99999999) is False
+            finally:
+                conn.execute("DELETE FROM posts WHERE post_id = %s", (p,))
+                conn.execute("DELETE FROM sites WHERE site_id = %s", (site,))
+                conn.commit()
+
+    def test_run_sync_task_returns_none_when_post_was_deleted(self, monkeypatch):
+        """Cas symétrique : job et poste disparus = annulation, pas échec."""
+        from app.services import sync_executor as executor_module
+
+        monkeypatch.setattr(executor_module, "JOB_COMMIT_WAIT_SECONDS", 0.2)
+        monkeypatch.setattr(executor_module, "JOB_COMMIT_POLL_SECONDS", 0.01)
+
+        assert executor_module.run_sync_task(1, 99999999) is None
 
 
 @pytest.mark.v19

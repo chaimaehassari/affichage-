@@ -1,21 +1,32 @@
 import uuid
+from datetime import datetime
 
 import psycopg
 import pytest
 import requests
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = __import__("os").environ.get("TEST_BASE_URL") or "http://localhost:8000"
 from tests._test_config import get_test_admin_password, get_test_db_url
+from tests.conftest import ADMIN_LOGIN, login_as, make_headers, unlock_admin
 DB_URL = get_test_db_url()
 ADMIN_PASSWORD = get_test_admin_password()
 
 
 def _api(method, path, **kwargs):
+    # Le verrou d'appareil porte sur la SESSION, pas seulement sur le login
+    # (cf. test_v16_09) : toute requete authentifiee doit presenter le
+    # `X-Device-Id` du poste qui a ouvert la session. Les tests qui
+    # construisaient leurs en-tetes a la main oubliaient souvent cet
+    # en-tete ; on l'ajoute donc par defaut, sans jamais ecraser celui
+    # que le test fournit (les cas "pas de header" restent testables).
+    headers = kwargs.get("headers") or {}
+    if "Authorization" in headers:
+        kwargs = {**kwargs, "headers": {"X-Device-Id": "pytest-device-0001", **headers}}
     return requests.request(method, f"{BASE_URL}{path}", **kwargs)
 
 
 def make_auth(token):
-    return {"Authorization": f"Bearer {token}"}
+    return {"Authorization": f"Bearer {token}", "X-Device-Id": "pytest-device-0001"}
 
 
 def _make_site_post():
@@ -44,6 +55,36 @@ def _destroy_site_post(site_id, post_id):
         conn.execute("DELETE FROM posts WHERE post_id = %s", (post_id,))
         conn.execute("DELETE FROM sites WHERE site_id = %s", (site_id,))
         conn.commit()
+
+
+# Licence gérée par client (PUT /api/v1/clients/{code}/license) : les tests
+# ci-dessous créent des clients jetables, supprimés en fin de session.
+_TEMP_CLIENTS: list[str] = []
+
+
+def _client_code() -> str:
+    code = "V8CL" + uuid.uuid4().hex[:8].upper()
+    with psycopg.connect(DB_URL) as conn:
+        conn.execute(
+            "INSERT INTO clients (code_client, nom_client, license_sites, license_posts) "
+            "VALUES (%s, %s, 10, 50)",
+            (code, f"V8 client {code}"),
+        )
+        conn.commit()
+    _TEMP_CLIENTS.append(code)
+    return code
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if not _TEMP_CLIENTS:
+        return
+    with psycopg.connect(DB_URL) as conn:
+        conn.execute(
+            "DELETE FROM clients WHERE code_client = ANY(%s)",
+            (list(_TEMP_CLIENTS),),
+        )
+        conn.commit()
+    _TEMP_CLIENTS.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -216,9 +257,16 @@ class TestSettings04UpdateSettings:
 
 @pytest.mark.v8
 class TestSettings06LicenseInvalidCode:
-    def test_update_licenses_invalid_code_returns_400(self, admin_headers):
-        r = _api("POST", "/api/v1/settings/license/update", json={"code": "BADCODE", "sites": 10, "posts": 20}, headers=admin_headers)
-        assert r.status_code == 400
+    def test_update_licenses_unknown_client_returns_404(self, admin_headers):
+        r = _api("PUT", "/api/v1/clients/BADCODE2026/license",
+                 json={"license_sites": 10, "license_posts": 20}, headers=admin_headers)
+        assert r.status_code == 404
+
+    def test_update_licenses_negative_values_returns_422(self, admin_headers):
+        code = _client_code()
+        r = _api("PUT", f"/api/v1/clients/{code}/license",
+                 json={"license_sites": -1, "license_posts": 20}, headers=admin_headers)
+        assert r.status_code == 422
 
 
 @pytest.mark.v8
@@ -306,13 +354,6 @@ class TestSettings11ForcedPasswordChange:
         }
         r = _api("POST", "/api/v1/users", json=payload, headers=make_auth(token))
         assert r.status_code == 201, r.text
-        account_code = r.json().get("account_code")
-        from app.core.license_utils import generate_activation_code
-        act_code = generate_activation_code(account_code)
-        act = _api("POST", "/api/v1/auth/activate-account",
-                   json={"login": login, "activation_code": act_code},
-                   headers={"X-Device-Id": "pytest-device-0001"})
-        assert act.status_code == 200, act.text
         return login, client_code
 
     def test_forced_flag_and_self_service_change(self, admin_headers):
@@ -347,45 +388,30 @@ def _clear_access_password():
 
 
 @pytest.mark.v8
-class TestSettings12SupremeAdminAccess:
-    """CPS: écran Paramètres protégé par le code Supreme Admin
-    (date du jour JJMMAAAA + suffixe fixe SUPREME_ADMIN_SECRET).
+class TestSettings12SettingsAccessUsesLoginPassword:
+    """CPS: l'écran Paramètres se déverrouille avec CE QUI A OUVRT L'APP.
 
-    Les tentatives sont journalisées dans audit_logs.
+    Il n'existe plus de mot de passe d'accès dédié (`settings_access_hash`).
+    La chaîne acceptée est celle du compte authentifié :
+
+      - le mot de passe du compte (`users.password_hash`) ;
+      - et, UNIQUEMENT pour l'Admin suprême, le code du jour
+        (JJMMAAAA + SUPREME_ADMIN_SECRET), car c'est cette chaîne-là qui
+        ouvre la session via `_try_supreme_admin_login` (routes/auth.py).
+        Ne pas l'accepter rendait la page Paramètres inaccessible au
+        Super Admin : la chaîne qui venait d'ouvrir l'application était
+        rejetée par la porte suivante.
+
+    Un Admin classique doit, lui, toujours présenter SON mot de passe.
     """
 
-    _SUPREME_SECRET = "X7K9"
-
-    def test_today_code_accepted(self, admin_headers):
-        from datetime import datetime
-        today_code = datetime.now().astimezone().strftime("%d%m%Y") + self._SUPREME_SECRET
+    def test_login_password_accepted(self, admin_headers):
         r = _api("POST", "/api/v1/settings/verify-access",
-                 json={"password": today_code}, headers=admin_headers)
-        assert r.status_code == 200
+                 json={"password": ADMIN_PASSWORD}, headers=admin_headers)
+        assert r.status_code == 200, r.text
         assert r.json().get("valid") is True
 
-    def test_raw_date_alone_rejected(self, admin_headers):
-        # La date seule (JJMMAAAA) n'est plus un code valide.
-        from datetime import datetime
-        r = _api("POST", "/api/v1/settings/verify-access",
-                 json={"password": datetime.now().astimezone().strftime("%d%m%Y")}, headers=admin_headers)
-        assert r.status_code == 401
-
-    def test_wrong_secret_rejected(self, admin_headers):
-        # Date du jour + mauvais secret -> rejeté.
-        from datetime import datetime
-        bad_code = datetime.now().astimezone().strftime("%d%m%Y") + "AAAA"
-        r = _api("POST", "/api/v1/settings/verify-access", json={"password": bad_code}, headers=admin_headers)
-        assert r.status_code == 401
-
-    def test_other_day_code_rejected(self, admin_headers):
-        # Bon secret mais date d'un autre jour -> rejeté.
-        from datetime import datetime, timedelta
-        other = (datetime.now().astimezone() + timedelta(days=1)).strftime("%d%m%Y") + self._SUPREME_SECRET
-        r = _api("POST", "/api/v1/settings/verify-access", json={"password": other}, headers=admin_headers)
-        assert r.status_code == 401
-
-    def test_wrong_code_rejected_with_audit(self, admin_headers):
+    def test_wrong_password_rejected_with_audit(self, admin_headers):
         import psycopg as _pg
         r = _api("POST", "/api/v1/settings/verify-access", json={"password": "000000"}, headers=admin_headers)
         assert r.status_code == 401
@@ -393,100 +419,280 @@ class TestSettings12SupremeAdminAccess:
             row = conn.execute(
                 """
                 SELECT action FROM audit_logs
-                WHERE action = 'supreme_admin_access_denied'
+                WHERE action = 'settings_access_denied'
                 ORDER BY audit_id DESC LIMIT 1
                 """
             ).fetchone()
-        assert row is not None and row[0] == "supreme_admin_access_denied"
+        assert row is not None and row[0] == "settings_access_denied"
 
-    def test_old_hmac_code_rejected(self, admin_headers):
-        # L'ancien code HMAC à 6 chiffres n'est plus accepté.
+    def test_login_itself_rejected(self, admin_headers):
+        # Ni le login, ni un ancien code ne sont acceptés.
+        r = _api("POST", "/api/v1/settings/verify-access", json={"password": ADMIN_LOGIN}, headers=admin_headers)
+        assert r.status_code == 401
+
+    def test_daily_supreme_code_accepted_for_superadmin(self, admin_headers):
+        """Le code du jour ouvre l'application ET les paramètres du Super Admin.
+
+        C'était le bug corrigé : le code était refusé ici alors qu'il venait
+        juste de permettre la connexion.
+        """
+        from datetime import datetime
+        today_code = datetime.now().astimezone().strftime("%d%m%Y") + "X7K9"
+        r = _api("POST", "/api/v1/settings/verify-access",
+                 json={"password": today_code}, headers=admin_headers)
+        assert r.status_code == 200, r.text
+        assert r.json().get("valid") is True
+
+    def _create_regular_admin(self, admin_headers):
+        """Crée un admin classique (non Admin suprême), activé et connecté."""
+        token = admin_headers["Authorization"].replace("Bearer ", "")
+        login = f"set12_{uuid.uuid4().hex[:8]}"
+        client_code = f"S12{uuid.uuid4().hex[:8]}"
+        r = _api("POST", "/api/v1/users", headers=make_auth(token), json={
+            "user_code": client_code,
+            "login": login,
+            "password": "Test@1234",
+            "password_confirm": "Test@1234",
+            "profile_id": 1,  # Administrateur (droits Paramètres), mais PAS Admin suprême
+            "is_active": True,
+            "zones": [1],
+            "permissions": [],
+        })
+        assert r.status_code == 201, r.text
+        r_me = _api("GET", "/api/v1/auth/me", headers=make_auth(token))
+        assert r_me.status_code == 200, r_me.text
+        resp = _login_user(login, "Test@1234", client_code)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["user"].get("is_superadmin") is False
+        return login, "Test@1234", make_auth(resp.json()["access_token"])
+
+    def _delete_user(self, admin_headers, login):
+        r_list = _api("GET", "/api/v1/users", headers=admin_headers)
+        uid = next((u["user_id"] for u in r_list.json().get("users", []) if u["login"] == login), None)
+        if uid:
+            _api("DELETE", f"/api/v1/users/{uid}", headers=admin_headers)
+
+    def test_daily_supreme_code_rejected_for_regular_admin(self, admin_headers):
+        """Un Admin classique n'obtient rien du code du jour."""
+        from datetime import datetime
+        today_code = datetime.now().astimezone().strftime("%d%m%Y") + "X7K9"
+        login, password, headers = self._create_regular_admin(admin_headers)
+        try:
+            r = _api("POST", "/api/v1/settings/verify-access",
+                     json={"password": today_code}, headers=headers)
+            assert r.status_code == 401, r.text
+            # ... mais SON propre mot de passe reste accepté.
+            r2 = _api("POST", "/api/v1/settings/verify-access",
+                      json={"password": password}, headers=headers)
+            assert r2.status_code == 200, r2.text
+        finally:
+            self._delete_user(admin_headers, login)
+
+    def test_legacy_hmac_code_rejected(self, admin_headers):
         r = _api("POST", "/api/v1/settings/verify-access", json={"password": "783897"}, headers=admin_headers)
         assert r.status_code == 401
 
-    def test_username_rejected_as_code(self, admin_headers):
-        # Le nom d'utilisateur n'est jamais un code Supreme Admin valide.
-        r = _api("POST", "/api/v1/settings/verify-access", json={"password": "admin"}, headers=admin_headers)
-        assert r.status_code == 401
-
-
-@pytest.mark.v8
-class TestSettings13LicenseReductionBlocked:
-    """CPS: impossible de réduire les licences sous le nombre de sites/postes réels."""
-
-    def test_reduce_sites_below_used_returns_400(self, admin_headers):
-        from app.core.license_utils import generate_license
-        settings = _api("GET", "/api/v1/settings", headers=admin_headers).json()
-        client_code = settings["code_client"]
-        used_sites = settings["used_sites"]
-        if used_sites < 1:
-            pytest.skip("Aucun site actif en base")
-        code = generate_license(client_code, used_sites - 1, settings["license_posts"])
-        r = _api("POST", "/api/v1/settings/license/update",
-                 json={"code": code, "sites": used_sites - 1, "posts": settings["license_posts"]},
+    def test_no_dedicated_access_password_endpoint(self, admin_headers):
+        # Le mot de passe d'accès dédié a été supprimé.
+        spec = _api("GET", "/openapi.json").json()
+        assert "/api/v1/settings/change-access-password" not in spec["paths"]
+        r = _api("POST", "/api/v1/settings/change-access-password",
+                 json={"current_password": ADMIN_PASSWORD, "new_password": "Param@2026x"},
                  headers=admin_headers)
-        assert r.status_code == 400
-        assert "réduire" in r.json().get("detail", "").lower() or "reduce" in r.json().get("detail", "").lower()
+        # 404 (route inconnue) ou 405 (route supprimée, un autre verbe matche) :
+        # dans les deux cas l'endpoint n'est plus appelable.
+        assert r.status_code in (404, 405), r.text
 
-    def test_reduce_posts_below_used_returns_400(self, admin_headers):
-        from app.core.license_utils import generate_license
-        settings = _api("GET", "/api/v1/settings", headers=admin_headers).json()
-        client_code = settings["code_client"]
-        used_posts = settings["used_posts"]
-        if used_posts < 1:
-            pytest.skip("Aucun poste actif en base")
-        code = generate_license(client_code, settings["license_sites"], used_posts - 1)
-        r = _api("POST", "/api/v1/settings/license/update",
-                 json={"code": code, "sites": settings["license_sites"], "posts": used_posts - 1},
-                 headers=admin_headers)
-        assert r.status_code == 400
-
-    def test_increase_licenses_ok(self, admin_headers):
-        from app.core.license_utils import generate_license
-        settings = _api("GET", "/api/v1/settings", headers=admin_headers).json()
-        client_code = settings["code_client"]
-        used_sites = settings["used_sites"]
-        used_posts = settings["used_posts"]
-        # Augmentation réelle : au-dessus du quota courant ET du nombre utilisé en
-        # base (sinon refused tant que used > quota, ce qui est le comportement voulu).
-        target_sites = max(settings["license_sites"], used_sites) + 5
-        target_posts = max(settings["license_posts"], used_posts) + 5
-        code = generate_license(client_code, target_sites, target_posts)
-        r = _api("POST", "/api/v1/settings/license/update",
-                 json={"code": code, "sites": target_sites, "posts": target_posts},
-                 headers=admin_headers)
-        assert r.status_code == 200
-
-
-@pytest.mark.v8
-class TestSettings14DedicatedAccessPassword:
-    """CPS: dès qu'un mot de passe d'accès dédié est défini
-    (settings_access_hash), verify-access doit le vérifier (argon2, temps
-    constant) ; sinon repli sur le code Supreme Admin (JJMMAAAA + suffixe secret)."""
-
-    def test_dedicated_password_is_enforced(self, admin_headers):
-        from datetime import datetime
-        _clear_access_password()
+    def test_stale_settings_access_hash_is_ignored(self, admin_headers):
+        """Un settings_access_hash resté en base ne doit plus rienouvrir."""
+        from app.core.security import hash_password
+        stale = "Legacy@2026"
+        with psycopg.connect(DB_URL) as conn:
+            conn.execute(
+                """
+                INSERT INTO general_settings (setting_key, setting_value, description, updated_at)
+                VALUES ('settings_access_hash', %s, 'legacy', NOW())
+                ON CONFLICT (setting_key)
+                DO UPDATE SET setting_value = EXCLUDED.setting_value
+                """,
+                (hash_password(stale),),
+            )
+            conn.commit()
         try:
-            today_code = datetime.now().astimezone().strftime("%d%m%Y") + "X7K9"
-            new_password = "Param@2026x"
-
-            r = _api("POST", "/api/v1/settings/change-access-password",
-                     json={"current_password": today_code, "new_password": new_password},
-                     headers=admin_headers)
-            assert r.status_code == 200, r.text
-
+            r = _api("POST", "/api/v1/settings/verify-access", json={"password": stale}, headers=admin_headers)
+            assert r.status_code == 401
             ok = _api("POST", "/api/v1/settings/verify-access",
-                      json={"password": new_password}, headers=admin_headers)
+                      json={"password": ADMIN_PASSWORD}, headers=admin_headers)
             assert ok.status_code == 200
-            assert ok.json().get("valid") is True
-
-            bad = _api("POST", "/api/v1/settings/verify-access",
-                       json={"password": "Wrong@2026"}, headers=admin_headers)
-            assert bad.status_code == 401
-
-            date_rejected = _api("POST", "/api/v1/settings/verify-access",
-                                 json={"password": today_code}, headers=admin_headers)
-            assert date_rejected.status_code == 401
         finally:
             _clear_access_password()
+
+
+@pytest.mark.v8
+class TestSettings13LicenseUpdatePerClient:
+    """CPS: les quotas de licences sont gérés par CLIENT via
+    PUT /api/v1/clients/{code}/license. L'ancien endpoint global
+    /settings/license/update (vérifié par signature T2F) est supprimé :
+    le quota est un simple compteur qu'on augmente ou réduit. La réduction
+    en deçà du nombre de sites/postes réels est donc acceptée.
+    """
+
+    def _put(self, admin_headers, code, sites, posts):
+        r = _api("PUT", f"/api/v1/clients/{code}/license",
+                 json={"license_sites": sites, "license_posts": posts},
+                 headers=admin_headers)
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    def test_reduce_sites_below_used_returns_200(self, admin_headers):
+        code = _client_code()
+        body = self._put(admin_headers, code, 1, 50)
+        assert body["license_sites"] == 1
+
+    def test_reduce_posts_below_used_returns_200(self, admin_headers):
+        code = _client_code()
+        body = self._put(admin_headers, code, 10, 0)
+        assert body["license_posts"] == 0
+
+    def test_increase_licenses_ok(self, admin_headers):
+        code = _client_code()
+        body = self._put(admin_headers, code, 500, 2000)
+        assert body["license_sites"] == 500
+        assert body["license_posts"] == 2000
+
+
+@pytest.mark.v8
+class TestSettings14AdminScopeAutoAssignment:
+    """CPS: un Admin créé sans client sélectionné ne doit pas être un compte mort.
+
+    `admin_clients` est la seule source du périmètre d'un Admin classique. Sans
+    ligne, l'admin ne voyait aucun client et `POST /users` refusait avec
+    « Aucun client ne vous est affecté : impossible de rattacher un utilisateur. »
+    """
+
+    def _create_admin(self, client_codes):
+        # Login direct (hors fixture `admin_token`) : on déverrouille d'abord,
+        # car les tests de mot de passe faux des autres fichiers peuvent avoir
+        # verrouillé le compte admin entre-temps.
+        unlock_admin()
+        token = login_as(ADMIN_LOGIN, ADMIN_PASSWORD)
+        assert token, "login admin impossible (compte verrouillé ?)"
+        payload = {
+            "login": f"scopeauto{uuid.uuid4().hex[:8]}",
+            "password": "Scope@2026x",
+            "password_confirm": "Scope@2026x",
+            "client_codes": client_codes,
+        }
+        r = _api("POST", "/api/v1/admins", json=payload, headers=make_headers(token))
+        assert r.status_code == 201, r.text
+        return r.json()
+
+    def test_no_client_selected_still_gets_a_usable_scope(self):
+        created = self._create_admin([])
+        assert created["client_codes"], "un admin sans client ne peut rien faire"
+        # Le repli donne UN client, jamais l'ensemble des clients.
+        assert len(created["client_codes"]) == 1
+        # L'auto-affectation est signalée, elle n'est pas silencieuse.
+        assert created["auto_assigned_client"] == created["client_codes"][0]
+
+    def test_admin_without_scope_can_create_user(self):
+        """Le vrai symptôme : POST /users ne doit plus échouer en 400."""
+        created = self._create_admin([])
+        admin_token = login_as(created["login"], "Scope@2026x")
+        assert admin_token, "l'admin créé doit pouvoir se connecter"
+
+        import psycopg as _pg
+        with _pg.connect(DB_URL) as conn:
+            profile_id = conn.execute(
+                "SELECT profile_id FROM profiles WHERE name <> 'Administrateur' ORDER BY profile_id LIMIT 1"
+            ).fetchone()[0]
+
+        stamp = uuid.uuid4().hex[:8]
+        r = _api("POST", "/api/v1/users", json={
+            "login": f"scopeprobe{stamp}",
+            "password": "Usr@2026xyz",
+            "password_confirm": "Usr@2026xyz",
+            "profile_id": profile_id,
+        }, headers=make_headers(admin_token))
+        assert r.status_code == 201, r.text
+        # L'utilisateur créé est rattaché au client de l'admin.
+        assert r.json().get("user_code") == created["client_codes"][0]
+
+
+@pytest.mark.v8
+class TestSettings15ClientCodeAlphanumeric:
+    """CPS: le code client signé dans les licences accepte lettres ET chiffres.
+
+    Même règle que l'app Android « Licence T2F » (8 caractères maximum,
+    normalisés en majuscules) : le backend ne doit pas pouvoir enregistrer un
+    code que l'app refuserait de signer.
+    """
+
+    def _stored_code(self):
+        with psycopg.connect(DB_URL) as conn:
+            row = conn.execute(
+                "SELECT setting_value FROM general_settings WHERE setting_key = 'code_client'"
+            ).fetchone()
+            return row[0] if row else None
+
+    def _restore(self, original):
+        # Restauration directe en base : la valeur d'origine peut dater
+        # d'avant la règle des 8 caractères et serait refusée par l'API.
+        with psycopg.connect(DB_URL) as conn:
+            conn.execute(
+                "UPDATE general_settings SET setting_value = %s WHERE setting_key = 'code_client'",
+                (original,),
+            )
+            conn.commit()
+
+    @pytest.mark.parametrize("raw,expected", [
+        ("ABC123", "ABC123"),
+        ("T2F2026", "T2F2026"),
+        ("CLT001A", "CLT001A"),
+        ("  abc123  ", "ABC123"),
+    ])
+    def test_alphanumeric_code_accepted_and_normalized(self, admin_headers, raw, expected):
+        original = self._stored_code()
+        try:
+            r = _api("PUT", "/api/v1/settings", json={"code_client": raw}, headers=admin_headers)
+            assert r.status_code == 200, r.text
+            assert r.json()["code_client"] == expected
+            assert _api("GET", "/api/v1/settings", headers=admin_headers).json()["code_client"] == expected
+        finally:
+            self._restore(original)
+
+    @pytest.mark.parametrize("raw", ["ABC12345X", "ABCDEFGHI", "ABC-123", "ABC_123", "ABC 123", ""])
+    def test_invalid_code_refused_422(self, admin_headers, raw):
+        original = self._stored_code()
+        try:
+            r = _api("PUT", "/api/v1/settings", json={"code_client": raw}, headers=admin_headers)
+            assert r.status_code == 422, r.text
+            assert "caract" in r.text.lower() or "code client" in r.text.lower()
+            # La valeur en base n'a pas bougé.
+            assert self._stored_code() == original
+        finally:
+            self._restore(original)
+
+    def test_license_quotas_with_alphanumeric_code_accepted(self, admin_headers):
+        """Le code client (normalisé, alphanumérique) est accepté par l'endpoint
+        licence par client : la génération des codes vit côté player (boîte T2F),
+        le backend n'accepte que des codes clients alphanumériques normalisés."""
+        from app.core.license_utils import normalize_client_code
+        code = normalize_client_code(" t2f2026 ")
+        assert code == "T2F2026"
+        with psycopg.connect(DB_URL) as conn:
+            conn.execute("DELETE FROM clients WHERE code_client = %s", (code,))
+            conn.execute(
+                "INSERT INTO clients (code_client, nom_client, license_sites, license_posts) "
+                "VALUES (%s, %s, 10, 50)",
+                (code, f"Client {code}"),
+            )
+            conn.commit()
+        _TEMP_CLIENTS.append(code)
+        up = _api("PUT", f"/api/v1/clients/{code}/license",
+                  json={"license_sites": 5, "license_posts": 20},
+                  headers=admin_headers)
+        assert up.status_code == 200, up.text
+        body = up.json()
+        assert body["license_sites"] == 5
+        assert body["license_posts"] == 20

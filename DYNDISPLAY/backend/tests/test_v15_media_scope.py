@@ -6,10 +6,19 @@ import zlib
 import pytest
 import requests
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = __import__("os").environ.get("TEST_BASE_URL") or "http://localhost:8000"
 
 
 def _api(method, path, **kwargs):
+    # Le verrou d'appareil porte sur la SESSION, pas seulement sur le login
+    # (cf. test_v16_09) : toute requete authentifiee doit presenter le
+    # `X-Device-Id` du poste qui a ouvert la session. Les tests qui
+    # construisaient leurs en-tetes a la main oubliaient souvent cet
+    # en-tete ; on l'ajoute donc par defaut, sans jamais ecraser celui
+    # que le test fournit (les cas "pas de header" restent testables).
+    headers = kwargs.get("headers") or {}
+    if "Authorization" in headers:
+        kwargs = {**kwargs, "headers": {"X-Device-Id": "pytest-device-0001", **headers}}
     return requests.request(method, f"{BASE_URL}{path}", **kwargs)
 
 
@@ -46,11 +55,68 @@ CLIENT_PERMISSIONS = [
 ]
 
 
+# Clients crees par la fixture _create_client (voir _create_client_row).
+_TEMP_CLIENTS: list[str] = []
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_temp_clients():
+    """Supprime les clients temporaires et le contenu qui y est rattache."""
+    yield
+    if not _TEMP_CLIENTS:
+        return
+    import psycopg
+    from tests._test_config import get_test_db_url
+    conn = psycopg.connect(get_test_db_url())
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM clients WHERE code_client = ANY(%s)", (_TEMP_CLIENTS,))
+            ids = [r[0] for r in cur.fetchall()]
+            if ids:
+                cur.execute("DELETE FROM posts WHERE site_id IN "
+                            "(SELECT site_id FROM sites WHERE client_id = ANY(%s))", (ids,))
+                cur.execute("DELETE FROM sites WHERE client_id = ANY(%s)", (ids,))
+                cur.execute("DELETE FROM media WHERE client_code = ANY(%s)", (_TEMP_CLIENTS,))
+                cur.execute("DELETE FROM clients WHERE id = ANY(%s)", (ids,))
+        conn.commit()
+    finally:
+        conn.close()
+    _TEMP_CLIENTS.clear()
+
+
+def _create_client_row(user_code: str) -> str:
+    """Cree un vrai client dont le `code_client` est le `user_code` du compte.
+
+    `UserService._resolve_client_id()` rattache un compte a un client en
+    cherchant son `user_code` parmi les `clients.code_client` ; sans ce
+    preparatory les comptes de test tomberaient tous sur le client par defaut,
+    et les tests d'isolation entre « clients » ne testeraient plus rien.
+    """
+    import psycopg
+    from tests._test_config import get_test_db_url
+    conn = psycopg.connect(get_test_db_url())
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO clients (code_client, nom_client, license_sites, license_posts)
+                VALUES (%s, %s, 10, 50)
+                """,
+                (user_code, f"Client {user_code}"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    _TEMP_CLIENTS.append(user_code)
+    return user_code
+
+
 @pytest.mark.v15
 class TestMediaScope:
 
     def _create_client(self, admin_headers):
         user_code = f"MED{_uid()}"
+        _create_client_row(user_code)
         login = f"climedia_{_uid()}"
         payload = {
             "user_code": user_code,
@@ -59,19 +125,11 @@ class TestMediaScope:
             "password_confirm": TEST_PASSWORD,
             "profile_id": 2,
             "is_active": True,
-            "requires_activation": True,
             "zones": [1, 2, 3, 4],
             "permissions": CLIENT_PERMISSIONS,
         }
         r = _api("POST", "/api/v1/users", json=payload, headers=admin_headers)
         assert r.status_code == 201, r.text
-        account_code = r.json().get("account_code")
-        from app.core.license_utils import generate_activation_code
-        act_code = generate_activation_code(account_code)
-        act = _api("POST", "/api/v1/auth/activate-account",
-                   json={"login": login, "activation_code": act_code},
-                   headers={"X-Device-Id": "pytest-device-0001"})
-        assert act.status_code == 200, act.text
         return {"user_code": user_code, "login": login}
 
     def _find_user(self, admin_headers, login):
@@ -96,10 +154,6 @@ class TestMediaScope:
         u = self._find_user(admin_headers, c["login"])
         session = self._login(c["login"], c["user_code"])
         headers = {"Authorization": f"Bearer {session['access_token']}"}
-        from app.core.license_utils import generate_license
-        code = generate_license(c["user_code"], 5, 20)
-        r = _api("POST", "/api/v1/auth/activate", json={"code": code}, headers=headers)
-        assert r.status_code == 200, r.text
         return {"client": c, "user": u, "headers": headers}
 
     def _upload_png(self, headers, name):

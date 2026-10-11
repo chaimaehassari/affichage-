@@ -3,7 +3,7 @@ import uuid
 import pytest
 import requests
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = __import__("os").environ.get("TEST_BASE_URL") or "http://localhost:8000"
 
 
 def _api(method, path, **kwargs):
@@ -84,15 +84,7 @@ class TestUserEmail:
         }
         r = _api("POST", "/api/v1/users", json=payload, headers=admin_headers)
         assert r.status_code == 201, r.text
-        account_code = r.json().get("account_code")
         u = self._find_user(admin_headers, login)
-
-        from app.core.license_utils import generate_activation_code
-        act_code = generate_activation_code(account_code)
-        act = _api("POST", "/api/v1/auth/activate-account",
-                   json={"login": login, "activation_code": act_code},
-                   headers={"X-Device-Id": "pytest-device-0001"})
-        assert act.status_code == 200, act.text
 
         r = _api("POST", "/api/v1/auth/login", json={"login": login, "password": TEST_PASSWORD, "client_code": u["user_code"]},
                  headers={"X-Device-Id": "pytest-device-0001"})
@@ -104,9 +96,11 @@ class TestUserEmail:
 
     # EMAIL-04: Update email
     def test_email04_update_email(self, admin_headers):
-        login = self._create_user_with_email(admin_headers, email="old@example.com", suffix="004")
+        old_email = f"old_{_uid().lower()}@example.com"
+        login = self._create_user_with_email(admin_headers, email=old_email, suffix="004")
         u = self._find_user(admin_headers, login)
-        new_email = "new@example.com"
+        assert u.get("email") == old_email
+        new_email = f"new_{_uid().lower()}@example.com"
         r = _api("PUT", f"/api/v1/users/{u['user_id']}", headers=admin_headers, json={
             "login": login,
             "email": new_email,
@@ -196,7 +190,7 @@ class TestUserEmail:
 
     # EMAIL-11: Email is normalized to lowercase when creating
     def test_email11_email_normalized(self, admin_headers):
-        email = "MiXeD.CaSe@Example.COM"
+        email = f"MiXeD.CaSe{_uid()}@Example.COM"
         login = self._create_user_with_email(admin_headers, email=email, suffix="011")
         u = self._find_user(admin_headers, login)
         assert u.get("email") == email.lower()

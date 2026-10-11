@@ -3,10 +3,19 @@ import uuid
 import pytest
 import requests
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = __import__("os").environ.get("TEST_BASE_URL") or "http://localhost:8000"
 
 
 def _api(method, path, **kwargs):
+    # Le verrou d'appareil porte sur la SESSION, pas seulement sur le login
+    # (cf. test_v16_09) : toute requete authentifiee doit presenter le
+    # `X-Device-Id` du poste qui a ouvert la session. Les tests qui
+    # construisaient leurs en-tetes a la main oubliaient souvent cet
+    # en-tete ; on l'ajoute donc par defaut, sans jamais ecraser celui
+    # que le test fournit (les cas "pas de header" restent testables).
+    headers = kwargs.get("headers") or {}
+    if "Authorization" in headers:
+        kwargs = {**kwargs, "headers": {"X-Device-Id": "pytest-device-0001", **headers}}
     return requests.request(method, f"{BASE_URL}{path}", **kwargs)
 
 
@@ -17,19 +26,95 @@ def _uid():
 _USER_CODES = {}
 
 
-@pytest.fixture(scope="session")
+# --- Client de rattachement des sites -------------------------------------
+# Regle metier : « un site appartient toujours a un client precis »
+# (SiteService._resolve_client_id). Un site ne peut donc plus etre cree sans
+# `client_code`, meme par le Super Admin. Ces tests creent donc leurs sites
+# sous un vrai client, cree pour l'occasion puis supprime en fin de session.
+_TEMP_CLIENTS: list[str] = []
+
+
+def _client_code() -> str:
+    """Cree un client jetable et renvoie son `code_client`."""
+    import psycopg
+    from tests._test_config import get_test_db_url
+    code = "PRMCL" + _uid()
+    conn = psycopg.connect(get_test_db_url())
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO clients (code_client, nom_client, license_sites, license_posts) "
+                "VALUES (%s, %s, 10, 50)",
+                (code, f"Perm test client {code}"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    _TEMP_CLIENTS.append(code)
+    return code
+
+
+def _client_code_for_user(user_code: str) -> str:
+    """Rattache le `user_code` du compte a un vrai client et renvoie son code.
+
+    La regle « un site appartient toujours a un client » est resolue par
+    `canonical_client_code`, qui traduit un `user_code` en `clients.code_client`
+    via `users.client_id`. Ces comptes de test n'ont pas de client propre : on
+    leur en cree un, auquel le site est rattache.
+    """
+    import psycopg
+    from tests._test_config import get_test_db_url
+    code = "PRMCU" + _uid()
+    conn = psycopg.connect(get_test_db_url())
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO clients (code_client, nom_client, license_sites, license_posts) "
+                "VALUES (%s, %s, 10, 50)",
+                (code, f"Perm client {code}"),
+            )
+            cur.execute(
+                "UPDATE users SET client_id = (SELECT id FROM clients WHERE code_client = %s) "
+                "WHERE user_code = %s",
+                (code, user_code),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    _TEMP_CLIENTS.append(code)
+    return code
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if not _TEMP_CLIENTS:
+        return
+    import psycopg
+    from tests._test_config import get_test_db_url
+    conn = psycopg.connect(get_test_db_url())
+    try:
+        with conn.cursor() as cur:
+            for code in _TEMP_CLIENTS:
+                cur.execute("DELETE FROM clients WHERE code_client = %s", (code,))
+        conn.commit()
+    finally:
+        conn.close()
+    _TEMP_CLIENTS.clear()
+
+
+@pytest.fixture(scope="function")
 def perm_map(admin_headers):
     r = _api("GET", "/api/v1/users/permissions", headers=admin_headers)
     assert r.status_code == 200, r.text
     return {p["code"]: p["permission_id"] for p in r.json()}
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="function")
 def site_post(admin_headers):
     r = _api("POST", "/api/v1/sites", headers=admin_headers, json={
         "code": f"PRM_SITE_{_uid()}",
         "name": "Perm test site",
         "is_active": True,
+        "client_code": _client_code(),
     })
     assert r.status_code == 201, r.text
     site_id = r.json()["site_id"]
@@ -69,14 +154,6 @@ def _create_user(admin_headers, perm_map, codes=(), zones=(), view=True):
     }
     r = _api("POST", "/api/v1/users", json=payload, headers=admin_headers)
     assert r.status_code == 201, r.text
-    account_code = r.json().get("account_code")
-
-    from app.core.license_utils import generate_activation_code
-    act_code = generate_activation_code(account_code)
-    act = _api("POST", "/api/v1/auth/activate-account",
-               json={"login": login, "activation_code": act_code},
-               headers={"X-Device-Id": "pytest-device-0001"})
-    assert act.status_code == 200, act.text
 
     _USER_CODES[login] = client_code
     return login
@@ -146,6 +223,7 @@ class TestPermissions:
             "code": f"NOSITE_{_uid()}",
             "name": "Should fail",
             "is_active": True,
+            "client_code": _client_code(),
         })
         assert r2.status_code == 403, r2.text
         _delete_user(admin_headers, login)
@@ -181,7 +259,7 @@ class TestPermissions:
         # un poste appartenant au client de l'utilisateur.
         r_site = _api("POST", "/api/v1/sites", headers=admin_headers, json={
             "code": f"ZS_{_uid()}", "name": "Zone scope site", "is_active": True,
-            "client_code": client_code,
+            "client_code": _client_code_for_user(client_code),
         })
         assert r_site.status_code == 201, r_site.text
         site_id = r_site.json()["site_id"]

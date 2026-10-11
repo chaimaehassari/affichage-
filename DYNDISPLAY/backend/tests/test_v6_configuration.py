@@ -3,7 +3,7 @@ import uuid
 import pytest
 import requests
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = __import__("os").environ.get("TEST_BASE_URL") or "http://localhost:8000"
 
 
 def _api(method, path, **kwargs):
@@ -18,6 +18,7 @@ def _create_site(headers, code=None):
     code = code or f"V6_{_uid()}"
     r = _api("POST", "/api/v1/sites", headers=headers, json={
         "code": code, "name": f"Site {code}", "is_active": True,
+   "client_code": _client_code(),
     })
     assert r.status_code == 201, r.text
     return r.json()
@@ -53,6 +54,51 @@ def _cleanup(headers, site_id, post_id=None):
 
 def _get_schedule_id(schedule_json):
     return schedule_json.get("schedule_id") or schedule_json.get("id")
+
+
+
+# --- Client de rattachement des sites -------------------------------------
+# Regle metier : « un site appartient toujours a un client precis »
+# (SiteService._resolve_client_id). Un site cree sans `client_code` est refuse.
+# Ces anciens tests, ecrits avant le chantier multi-clients, creaient leurs
+# sites sans client : on y rattache un client jetable, supprime en fin de
+# session pour ne pas polluer la table partagee `clients`.
+_TEMP_CLIENTS: list[str] = []
+
+
+def _client_code() -> str:
+    import psycopg
+    from tests._test_config import get_test_db_url
+    code = "TC" + uuid.uuid4().hex[:8].upper()
+    conn = psycopg.connect(get_test_db_url())
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO clients (code_client, nom_client, license_sites, license_posts) "
+                "VALUES (%s, %s, 10, 50)",
+                (code, f"Test client {code}"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    _TEMP_CLIENTS.append(code)
+    return code
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if not _TEMP_CLIENTS:
+        return
+    import psycopg
+    from tests._test_config import get_test_db_url
+    conn = psycopg.connect(get_test_db_url())
+    try:
+        with conn.cursor() as cur:
+            for code in _TEMP_CLIENTS:
+                cur.execute("DELETE FROM clients WHERE code_client = %s", (code,))
+        conn.commit()
+    finally:
+        conn.close()
+    _TEMP_CLIENTS.clear()
 
 
 @pytest.mark.v6

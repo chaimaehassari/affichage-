@@ -6,7 +6,7 @@ import psycopg
 import pytest
 import requests
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = __import__("os").environ.get("TEST_BASE_URL") or "http://localhost:8000"
 ADMIN_LOGIN = "admin"
 from tests._test_config import get_test_admin_password, get_test_db_url
 ADMIN_PASSWORD = get_test_admin_password()
@@ -95,6 +95,89 @@ def test_auth06_access_with_expired_token():
 
     r = _api("GET", "/api/v1/auth/me", headers=make_headers(expired_token))
     assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# AUTH-06bis: Renouvellement de session (token typ=refresh)
+#
+# Non-régression de la cascade de 401 : le token d'accès ne dure que 30 min
+# (ACCESS_TOKEN_EXPIRE_MINUTES) et doit pouvoir être renouvelé sans
+# reconnecter, à partir d'un token de type distinct.
+# ---------------------------------------------------------------------------
+def _login_with_refresh():
+    r = _api("POST", "/api/v1/auth/login",
+             json={"login": ADMIN_LOGIN, "password": ADMIN_PASSWORD})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+@pytest.mark.v1
+def test_auth06b_login_returns_refresh_token():
+    body = _login_with_refresh()
+    assert body.get("refresh_token"), "le login doit renvoyer un refresh token"
+    decoded = jwt.decode(
+        body["refresh_token"], JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM]
+    )
+    assert decoded.get("typ") == "refresh", "le refresh token doit être typ=refresh"
+    assert decoded["sub"] is not None
+
+
+@pytest.mark.v1
+def test_auth06c_refresh_returns_new_pair():
+    body = _login_with_refresh()
+    r = _api("POST", "/api/v1/auth/refresh",
+             json={"refresh_token": body["refresh_token"]})
+    assert r.status_code == 200, r.text
+
+    renewed = r.json()
+    assert renewed["access_token"]
+    assert renewed["refresh_token"]
+
+    # Le nouveau couple est réellement utilisable.
+    r_me = _api("GET", "/api/v1/auth/me", headers=make_headers(renewed["access_token"]))
+    assert r_me.status_code == 200, r.text
+    assert r_me.json()["login"] == ADMIN_LOGIN
+
+
+@pytest.mark.v1
+def test_auth06d_refresh_rejects_access_token():
+    """Un token d'accès ne doit pas pouvoir être rejoué comme refresh."""
+    body = _login_with_refresh()
+    r = _api("POST", "/api/v1/auth/refresh",
+             json={"refresh_token": body["access_token"]})
+    assert r.status_code == 401, r.text
+
+
+@pytest.mark.v1
+def test_auth06e_refresh_token_cannot_call_api():
+    """Et symétriquement : un token de refresh ne donne aucun accès API."""
+    body = _login_with_refresh()
+    r = _api("GET", "/api/v1/auth/me", headers=make_headers(body["refresh_token"]))
+    assert r.status_code == 401, r.text
+
+
+@pytest.mark.v1
+def test_auth06f_refresh_rejects_garbage_and_expired():
+    r = _api("POST", "/api/v1/auth/refresh", json={"refresh_token": "pas-un-jwt"})
+    assert r.status_code == 401, r.text
+
+    expired = jwt.encode(
+        {
+            "sub": "1",
+            "typ": "refresh",
+            "exp": datetime.now(timezone.utc) - timedelta(hours=1),
+        },
+        JWT_SECRET_KEY,
+        algorithm=JWT_ALGORITHM,
+    )
+    r2 = _api("POST", "/api/v1/auth/refresh", json={"refresh_token": expired})
+    assert r2.status_code == 401, r2.text
+
+
+@pytest.mark.v1
+def test_auth06g_refresh_missing_field_returns_422():
+    r = _api("POST", "/api/v1/auth/refresh", json={})
+    assert r.status_code == 422, r.text
 
 
 # ---------------------------------------------------------------------------

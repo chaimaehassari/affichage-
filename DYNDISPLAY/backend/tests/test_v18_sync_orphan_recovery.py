@@ -26,7 +26,7 @@ from psycopg.rows import dict_row
 
 from tests._test_config import get_test_db_url
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = __import__("os").environ.get("TEST_BASE_URL") or "http://localhost:8000"
 DB_URL = get_test_db_url()
 
 
@@ -36,6 +36,49 @@ def _api(method, path, **kwargs):
 
 def _uid():
     return uuid.uuid4().hex[:6].upper()
+
+
+# Regle metier : « un site appartient toujours a un client precis ». Le site
+# cree par API doit etre rattache a un client existant.
+_TEMP_CLIENTS: list[str] = []
+
+
+def _client_code() -> str:
+    code = "V18CL" + _uid()
+    conn = _open()
+    try:
+        conn.execute(
+            "INSERT INTO clients (code_client, nom_client, license_sites, license_posts) "
+            "VALUES (%s, %s, 10, 50)",
+            (code, f"V18 client {code}"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    _TEMP_CLIENTS.append(code)
+    return code
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if not _TEMP_CLIENTS:
+        return
+    conn = _open()
+    try:
+        conn.execute(
+            "DELETE FROM posts WHERE site_id IN "
+            "(SELECT site_id FROM sites WHERE client_code = ANY(%s))",
+            (list(_TEMP_CLIENTS),),
+        )
+        conn.execute(
+            "DELETE FROM sites WHERE client_code = ANY(%s)", (list(_TEMP_CLIENTS),)
+        )
+        conn.execute(
+            "DELETE FROM clients WHERE code_client = ANY(%s)", (list(_TEMP_CLIENTS),)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    _TEMP_CLIENTS.clear()
 
 
 def _open():
@@ -360,8 +403,10 @@ class TestSyncOrphanRecovery:
 class TestApplyConfigFailedListSurfaced:
 
     def test_failed_post_ids_surfaces_the_group_failures(self, admin_headers):
+        client_code = _client_code()
         r = _api("POST", "/api/v1/sites", headers=admin_headers,
-                 json={"code": f"V18_{_uid()}", "name": "Site v18", "is_active": True})
+                 json={"code": f"V18_{_uid()}", "name": "Site v18", "is_active": True,
+                       "client_code": client_code})
         assert r.status_code == 201, r.text
         site_id = r.json()["site_id"]
         posts = []

@@ -7,7 +7,7 @@ import psycopg
 import pytest
 import requests
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = __import__("os").environ.get("TEST_BASE_URL") or "http://localhost:8000"
 from tests._test_config import get_test_db_url
 DB_URL = get_test_db_url()
 
@@ -68,6 +68,64 @@ def _get_post_code(headers, post_id=POST_ID):
         if p.get("post_id") == post_id:
             return p.get("code")
     return None
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _seed_post_7():
+    """Garantit l'existence du poste POST_ID (poste de démonstration) avec un
+    layout + zone assignés, pour que config-preview et la sync SFTP aboutissent.
+
+    Le poste 7 manquait dans la base de test : tous les tests v7 qui
+    déclenchent une sync dessus partaient en 404/400. Création idempotente
+    (site + poste + layout + zone + configuration) strictement en base.
+    """
+    with psycopg.connect(DB_URL) as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM posts WHERE post_id = %s", (POST_ID,)
+        ).fetchone()
+        if not exists:
+            client_code = conn.execute(
+                "SELECT code_client FROM clients ORDER BY id LIMIT 1"
+            ).fetchone()
+            site_id = conn.execute(
+                "INSERT INTO sites (code, name, is_active, client_id, client_code) "
+                "VALUES (%s, %s, TRUE, (SELECT id FROM clients ORDER BY id LIMIT 1), %s) "
+                "RETURNING site_id",
+                (f"V7SITE{uuid.uuid4().hex[:6].upper()}",
+                 "Site V7 (poste de démonstration)",
+                 client_code[0] if client_code else None),
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO posts (post_id, site_id, code, name, is_active) "
+                "VALUES (%s, %s, %s, %s, TRUE)",
+                (POST_ID, site_id, "V7POST7", "Poste 7"),
+            )
+        layout = conn.execute(
+            "SELECT layout_id FROM layouts WHERE is_active = TRUE ORDER BY layout_id LIMIT 1"
+        ).fetchone()
+        if layout:
+            layout_id = layout[0]
+        else:
+            layout_id = conn.execute(
+                "INSERT INTO layouts (name, is_active) VALUES (%s, TRUE) RETURNING layout_id",
+                ("Layout V7",),
+            ).fetchone()[0]
+        has_zone = conn.execute(
+            "SELECT 1 FROM layout_zones WHERE layout_id = %s LIMIT 1", (layout_id,)
+        ).fetchone()
+        if not has_zone:
+            conn.execute(
+                "INSERT INTO layout_zones (layout_id, zone_number, position_x, position_y, "
+                "width, height, is_active) VALUES (%s, 1, 0, 0, 100, 100, TRUE)",
+                (layout_id,),
+            )
+        conn.execute(
+            "INSERT INTO post_configurations (post_id, layout_id, loop_enabled, "
+            "schedule_enabled, display_enabled) VALUES (%s, %s, TRUE, FALSE, TRUE) "
+            "ON CONFLICT (post_id) DO UPDATE SET layout_id = EXCLUDED.layout_id",
+            (POST_ID, layout_id),
+        )
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +369,32 @@ class TestSync12AutoScheduledSync:
 
         site_id, post_id = _make_site_post()
         test_start = datetime.now(tz_utc.utc)
+
+        # Isolation du fan-out : schedule_auto_syncs() crée un job par poste
+        # ACTIF (sync_service.py). Sur la base de test partagée, des centaines
+        # de postes résiduels feraient soumettre ~230 jobs d'un coup à
+        # l'executor global (module-level, partagé entre les runs pytest) :
+        # sa file profonde affamait alors les syncs d'autres tests (Sync05/…),
+        # d'où l'échec « flaky » dépendant de l'ordre des runs. En n'activant
+        # QUE le poste de ce test, le scheduler ne crée qu'un job : la
+        # vérification d'idempotence reste valable, sans saturer la file.
+        with psycopg.connect(DB_URL) as conn:
+            previously_active = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT post_id FROM posts WHERE is_active = TRUE AND post_id <> %s",
+                    (post_id,),
+                ).fetchall()
+            ]
+            conn.execute(
+                "UPDATE posts SET is_active = FALSE WHERE post_id = ANY(%s)",
+                (previously_active,),
+            )
+            conn.execute(
+                "UPDATE posts SET is_active = TRUE WHERE post_id = %s", (post_id,)
+            )
+            conn.commit()
+
         try:
             r = _api("PUT", "/api/v1/settings", headers=admin_headers, json={
                 "sync_auto_enabled": True,
@@ -357,6 +441,13 @@ class TestSync12AutoScheduledSync:
                 conn.execute("DELETE FROM sync_jobs WHERE created_at >= %s", (test_start,))
                 conn.commit()
             _destroy_site_post(site_id, post_id)
+            # Restaure l'état d'activation des postes enregistré avant le test.
+            with psycopg.connect(DB_URL) as conn:
+                conn.execute(
+                    "UPDATE posts SET is_active = TRUE WHERE post_id = ANY(%s)",
+                    (previously_active,),
+                )
+                conn.commit()
 
 
 @pytest.mark.v7

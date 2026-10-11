@@ -3,7 +3,7 @@ import uuid
 import pytest
 import requests
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = __import__("os").environ.get("TEST_BASE_URL") or "http://localhost:8000"
 
 
 TEST_DEVICE = "pytest-device-0001"
@@ -15,16 +15,6 @@ def _api(method, path, **kwargs):
 
 def _uid():
     return uuid.uuid4().hex[:6].upper()
-
-
-def _activate_account(login, account_code, device_id=TEST_DEVICE):
-    from app.core.license_utils import generate_activation_code
-    code = generate_activation_code(account_code)
-    return requests.post(
-        f"{BASE_URL}/api/v1/auth/activate-account",
-        json={"login": login, "activation_code": code},
-        headers={"X-Device-Id": device_id},
-    )
 
 
 def _create_test_user(headers, suffix="001"):
@@ -46,7 +36,6 @@ def _create_test_user(headers, suffix="001"):
     for u in r_list.json().get("users", []):
         if u["login"] == login:
             u["_client_code"] = client_code
-            u["_account_code"] = r.json().get("account_code")
             return u
     raise AssertionError(f"User {login} not found after creation")
 
@@ -224,9 +213,6 @@ class TestUsers:
             "new_password": new_password, "password_confirm": new_password,
         })
         assert r.status_code == 200
-
-        act = _activate_account(user_login, created["_account_code"])
-        assert act.status_code == 200, act.text
 
         r2 = _api("POST", "/api/v1/auth/login", json={"login": user_login, "password": new_password, "client_code": created["_client_code"]},
                   headers={"X-Device-Id": TEST_DEVICE})

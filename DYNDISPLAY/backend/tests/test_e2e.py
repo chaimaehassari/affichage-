@@ -6,7 +6,7 @@ import uuid
 import pytest
 import requests
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = __import__("os").environ.get("TEST_BASE_URL") or "http://localhost:8000"
 
 SFTP_BASE = r"C:\DYNDISPLAY-SFTP\players"
 
@@ -17,6 +17,55 @@ def _api(method, path, **kwargs):
 
 def _unique(suffix=""):
     return uuid.uuid4().hex[:8].upper() + suffix
+
+
+# --- Client de rattachement des sites -------------------------------------
+# Regle metier : « un site appartient toujours a un client precis »
+# (SiteService._resolve_client_id). Avant le chantier multi-clients, un site
+# pouvait etre cree sans `client_code` etherait sur un « client par defaut ».
+# Ce n'est plus possible : ces tests creent donc leurs sites sous un vrai
+# client, cree pour l'occasion puis supprime.
+_TEMP_CLIENTS: list[str] = []
+
+
+def _client_code() -> str:
+    """Cree un client jetable et renvoie son `code_client`."""
+    import psycopg
+    from tests._test_config import get_test_db_url
+    code = "E2ECL" + _unique()
+    conn = psycopg.connect(get_test_db_url())
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO clients (code_client, nom_client, license_sites, license_posts) "
+                "VALUES (%s, %s, 10, 50)",
+                (code, f"E2E client {code}"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    _TEMP_CLIENTS.append(code)
+    return code
+
+
+def _cleanup_temp_clients():
+    if not _TEMP_CLIENTS:
+        return
+    import psycopg
+    from tests._test_config import get_test_db_url
+    conn = psycopg.connect(get_test_db_url())
+    try:
+        with conn.cursor() as cur:
+            for code in _TEMP_CLIENTS:
+                cur.execute("DELETE FROM clients WHERE code_client = %s", (code,))
+        conn.commit()
+    finally:
+        conn.close()
+    _TEMP_CLIENTS.clear()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    _cleanup_temp_clients()
 
 
 @pytest.mark.e2e
@@ -33,6 +82,7 @@ class TestE2E01CompleteAdminWorkflow:
             "name": "E2E Site 001",
             "address": "123 Test Street",
             "description": "E2E test site",
+            "client_code": _client_code(),
         })
         assert resp.status_code == 201, resp.text
         site_id = resp.json()["site_id"]
@@ -142,6 +192,7 @@ class TestE2E02MultiSiteMultiPost:
         resp = _api("POST", "/api/v1/sites", headers=headers, json={
             "code": e2e_multi_site_code,
             "name": "E2E Multi-Site",
+            "client_code": _client_code(),
         })
         assert resp.status_code == 201, resp.text
         site_id = resp.json()["site_id"]
@@ -267,6 +318,7 @@ class TestE2E03MediaUploadToConfiguration:
         e2e_media_post_code = "E2E_" + _unique("MP")
         resp = _api("POST", "/api/v1/sites", headers=headers, json={
             "code": e2e_media_site_code, "name": "E2E Media Site",
+            "client_code": _client_code(),
         })
         assert resp.status_code == 201, resp.text
         site_id = resp.json()["site_id"]

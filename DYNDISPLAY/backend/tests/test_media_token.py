@@ -21,7 +21,7 @@ import requests
 from app.core.config import get_settings
 from app.core.security import create_media_token
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = __import__("os").environ.get("TEST_BASE_URL") or "http://localhost:8000"
 
 
 def _api(method, path, **kwargs):
