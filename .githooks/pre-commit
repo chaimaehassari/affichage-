@@ -1,0 +1,18 @@
+#!/bin/sh
+# Pre-commit : bloque tout commit introduisant une clé privée hex de 64
+# caractères (deny-list + heuristique "contexte clé privée").
+#
+# Activation (une seule fois par clone) :
+#   git config core.hooksPath .githooks
+#
+set -e
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+if command -v py >/dev/null 2>&1; then
+  exec py -3 scripts/check_no_private_keys.py --staged
+fi
+if command -v python3 >/dev/null 2>&1; then
+  exec python3 scripts/check_no_private_keys.py --staged
+fi
+echo "pre-commit: aucun interpréteur Python trouvé (py/python3) — vérification ignoree." >&2
+exit 0

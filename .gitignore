@@ -1,0 +1,25 @@
+# ───────────────────────────────────────────────────────────────────────────
+# .gitignore racine — monorepo DynDisplay
+# ───────────────────────────────────────────────────────────────────────────
+
+# Artefacts de test (sorties pytest) — jamais à committer
+pytest*.txt
+
+# Scripts temporaires (débogage local)
+query
+stop
+
+# Journaux
+*.log
+
+# Secrets / configuration locale — NE JAMAIS COMMITTER
+.env
+.env.*
+!.env.example
+admin-credentials.txt
+local.properties
+
+# Données locales volumineuses / générées
+media_storage/
+logs/
+Temp/
