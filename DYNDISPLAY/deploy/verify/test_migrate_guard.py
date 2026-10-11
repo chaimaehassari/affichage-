@@ -83,6 +83,11 @@ def main():
     rc, out = migrate("status", "--yes-i-know")
     check("accepte (code 0)", rc == 0, f"rc={rc}")
 
+    print("\n=== 7. apply --db correct (--dry-run) : accepte, sans ecriture ===")
+    rc, out = migrate("apply", "--db", TMP, "--dry-run")
+    check("accepte (code 0)", rc == 0, f"rc={rc}")
+    check("pas d'erreur d'argument", "unrecognized arguments" not in out)
+
     raw(f'DROP DATABASE IF EXISTS "{TMP}"')
 
     print("\n" + "=" * 62)

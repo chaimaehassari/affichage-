@@ -387,6 +387,11 @@ def main() -> int:
         "--yes", action="store_true",
         help="applique sans confirmation (installateur / mise a jour non interactifs)",
     )
+    # Le garde-fou de cible s'applique AUSSI a `apply` : sans cela, l'installateur
+    # (run_migrations.py -> `apply --yes --db <nom>`) echouait sur un argument
+    # inconnu (--db), et un `apply` non confirme n'aurait de toute facon jamais
+    # pu etre valide.
+    _add_target_args(p_apply)
     args = parser.parse_args()
 
     # CIBLE : DATABASE_URL si elle est renseignee, sinon POSTGRES_*.
