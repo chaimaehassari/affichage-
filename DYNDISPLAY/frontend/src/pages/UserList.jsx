@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { LogOut, ArrowLeft, Plus, Pencil, Trash2, Search, ToggleLeft, ToggleRight, ShieldCheck, Building2 } from 'lucide-react';
 import ThemeToggle from '../components/ThemeToggle';
@@ -9,10 +9,11 @@ import apiService, { extractDetailMessage } from '../services/api';
 export default function UserList() {
   const { logout, user, hasPermission, isSuperAdmin } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
   const [users, setUsers] = useState([]);
   const [profiles, setProfiles] = useState([]);
-  const [adminClients, setAdminClients] = useState({});
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(null);
   const [search, setSearch] = useState('');
   const [roleFilter, setRoleFilter] = useState('');
   const [deleteConfirm, setDeleteConfirm] = useState(null);
@@ -24,37 +25,57 @@ export default function UserList() {
 
   async function fetchUsers() {
     setLoading(true);
+    setLoadError(null);
     try {
       const params = search ? `?search=${encodeURIComponent(search)}` : '';
       const result = await apiService.get(`/api/v1/users${params}`);
-      if (result.ok && result.data) {
-        setUsers(result.data.users || []);
+      if (!result.ok) {
+        // Erreur explicite : la liste ne doit jamais rester silencieusement vide.
+        setUsers([]);
+        setLoadError(
+          result.status === 0
+            ? `Serveur injoignable${result.error ? ` (${result.error})` : ''}.`
+            : result.status === 401
+              ? 'Session expirée : reconnectez-vous.'
+              : result.status === 403
+                ? "Vous n'avez pas l'autorisation de consulter la liste des utilisateurs."
+                : `Impossible de charger les utilisateurs (HTTP ${result.status}).`
+        );
+        return;
       }
+      setUsers(result.data?.users || []);
     } catch (e) {
-      console.error(e);
+      setUsers([]);
+      setLoadError(
+        e?.message
+          ? `Impossible de joindre le serveur : ${e.message}`
+          : 'Impossible de joindre le serveur.'
+      );
     } finally {
       setLoading(false);
     }
   }
 
+  // Chargement initial + rechargement a chaque changement de recherche.
+  useEffect(() => { fetchUsers(); /* eslint-disable-next-line */ }, [search]);
+
+  // Rafraichissement quand on revient d'un formulaire (creation / edition) :
+  // la page d'origine est montee de nouveau, le useEffect ci-dessus suffit.
   useEffect(() => {
     (async () => {
       const profilesRes = await apiService.get('/api/v1/users/profiles');
       if (profilesRes.ok) setProfiles(profilesRes.data || []);
-      if (isSuperAdmin) {
-        const adminsRes = await apiService.get('/api/v1/admins');
-        if (adminsRes.ok && adminsRes.data) {
-          const map = {};
-          (adminsRes.data.admins || []).forEach(a => {
-            map[a.user_id] = a.client_codes || [];
-          });
-          setAdminClients(map);
-        }
-      }
     })();
-  }, [isSuperAdmin]);
+  }, []);
 
-  useEffect(() => { fetchUsers(); }, [search]);
+  // Confirmation affichee au retour du formulaire : la liste vient d'etre
+  // rechargee par l'effet ci-dessus, le nouvel utilisateur y figure.
+  useEffect(() => {
+    if (location.state?.created) {
+      setNotification({ type: 'success', text: 'Utilisateur créé avec succès.' });
+      navigate('/users', { replace: true, state: {} });
+    }
+  }, [location.state]);
 
   async function handleDelete(userId) {
     try {
@@ -88,7 +109,6 @@ export default function UserList() {
         profile_id: ud.profile_id,
         admin_id: ud.admin_id || null,
         is_active: !u.is_active,
-        requires_activation: ud.is_activated === false,
         zones: (ud.zones || []).filter(z => z.is_allowed).map(z => z.zone_number),
         groups: (ud.groups || []).map(g => g),
         permissions: (ud.permissions || []).map(p => ({
@@ -151,12 +171,6 @@ export default function UserList() {
       if (result.ok) {
         setNotification({ type: 'success', text: 'Clients affectés mis à jour.' });
         setClientsModal(null);
-        const adminsRes = await apiService.get('/api/v1/admins');
-        if (adminsRes.ok && adminsRes.data) {
-          const map = {};
-          (adminsRes.data.admins || []).forEach(x => { map[x.user_id] = x.client_codes || []; });
-          setAdminClients(map);
-        }
       } else {
         setNotification({ type: 'error', text: extractDetailMessage(result.data?.detail, 'Erreur lors de l\'enregistrement.') });
       }
@@ -307,20 +321,36 @@ export default function UserList() {
                     <th className="text-left px-4 py-3 text-xs font-semibold text-[#a0a7b3] uppercase tracking-wider">Code</th>
                     <th className="text-left px-4 py-3 text-xs font-semibold text-[#a0a7b3] uppercase tracking-wider">Rôle</th>
                     <th className="text-left px-4 py-3 text-xs font-semibold text-[#a0a7b3] uppercase tracking-wider">Login</th>
-                    <th className="text-left px-4 py-3 text-xs font-semibold text-[#a0a7b3] uppercase tracking-wider">Email</th>
-                    <th className="text-left px-4 py-3 text-xs font-semibold text-[#a0a7b3] uppercase tracking-wider">{isSuperAdmin ? 'Admin responsable / Clients' : 'Admin responsable'}</th>
+                    <th className="text-left px-4 py-3 text-xs font-semibold text-[#a0a7b3] uppercase tracking-wider">Admin responsable</th>
                     <th className="text-left px-4 py-3 text-xs font-semibold text-[#a0a7b3] uppercase tracking-wider">Statut</th>
                     <th className="text-right px-4 py-3 text-xs font-semibold text-[#a0a7b3] uppercase tracking-wider">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
                   {loading ? (
-                    <tr><td colSpan={7} className="px-4 py-8 text-center text-[#a0a7b3] text-sm">Chargement...</td></tr>
+                    <tr><td colSpan={6} className="px-4 py-8 text-center text-[#a0a7b3] text-sm">Chargement...</td></tr>
+                  ) : loadError ? (
+                    <tr>
+                      <td colSpan={6} className="px-4 py-8 text-center">
+                        <p className="text-red-400 text-sm font-medium">{loadError}</p>
+                        <button
+                          onClick={() => fetchUsers()}
+                          className="mt-3 text-sm px-3 py-1.5 rounded-lg border border-white/10 text-white hover:bg-white/5 transition-colors"
+                        >
+                          Réessayer
+                        </button>
+                      </td>
+                    </tr>
                   ) : filteredUsers.length === 0 ? (
-                    <tr><td colSpan={7} className="px-4 py-8 text-center text-[#a0a7b3] text-sm">Aucun utilisateur trouvé.</td></tr>
+                    <tr>
+                      <td colSpan={6} className="px-4 py-8 text-center text-[#a0a7b3] text-sm">
+                        {isSuperAdmin
+                          ? 'Aucun utilisateur trouvé.'
+                          : "Aucun utilisateur dans votre périmètre. Vos clients n'ont pas encore de compte, ou aucun compte ne vous est rattaché."}
+                      </td>
+                    </tr>
                   ) : (
                     filteredUsers.map((u) => {
-                      const codes = adminClients[u.user_id] || [];
                       return (
                         <tr key={u.user_id} className="border-b border-white/5 hover:bg-white/[0.02] transition-colors">
                           <td className="px-4 py-3 text-sm text-[#a0a7b3] overflow-visible">
@@ -335,23 +365,8 @@ export default function UserList() {
                           </td>
                           <td className="px-4 py-3 text-sm text-white">{u.profile_name || '—'}</td>
                           <td className="px-4 py-3 text-sm text-white">{u.login}</td>
-                          <td className="px-4 py-3 text-sm text-[#a0a7b3]">{u.email || '—'}</td>
                           <td className="px-4 py-3 text-sm text-[#a0a7b3]">
-                            {u.is_superadmin ? (
-                              <span className="text-xs text-[#a0a7b3]">Tous les clients</span>
-                            ) : u.profile_name === 'Administrateur' ? (
-                              codes.length > 0 ? (
-                                <div className="flex flex-wrap gap-1.5">
-                                  {codes.map((c) => (
-                                    <span key={c} className="inline-flex items-center text-xs font-medium px-2 py-0.5 rounded bg-white/5 border border-white/10 text-white">
-                                      {c}
-                                    </span>
-                                  ))}
-                                </div>
-                              ) : (
-                                <span className="text-xs text-[#a0a7b3]">Aucun client</span>
-                              )
-                            ) : (u.admin_login && u.admin_code) ? (
+                            {u.admin_login && u.admin_code ? (
                               `${u.admin_login} (${u.admin_code})`
                             ) : u.admin_login ? (
                               u.admin_login
@@ -367,11 +382,6 @@ export default function UserList() {
                             ) : (
                               <span className="inline-flex items-center text-xs font-medium px-2.5 py-1 rounded-full bg-zinc-500/15 text-white border border-zinc-500/20">
                                 Inactif
-                              </span>
-                            )}
-                            {u.is_activated === false && (
-                              <span className="inline-flex items-center text-xs font-medium px-2.5 py-1 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/25">
-                                À activer
                               </span>
                             )}
                           </td>

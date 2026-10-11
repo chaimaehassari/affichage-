@@ -4,10 +4,11 @@ import { useAuth } from '../contexts/AuthContext';
 import { LogOut, RefreshCw, CheckCircle, XCircle, Loader, Clock, ChevronRight, MonitorPlay, Image as ImageIcon, Film, LayoutGrid } from 'lucide-react';
 import ThemeToggle from '../components/ThemeToggle';
 import NavBar from '../components/NavBar';
-import { getGroups, getGroupPosts } from '../services/sites';
+import { getGroups, getGroupPosts, getPosts } from '../services/sites';
 import { startSync, getPostSyncStatus, syncGroup, getGroupMediaHierarchy, syncGroupMedia } from '../services/sync';
 import SyncProgressModal from '../components/SyncProgressModal';
 import { extractDetailMessage } from '../services/api';
+import { mapWithConcurrency } from '../utils/concurrency';
 
 function MediaSyncBadge({ status }) {
   if (!status || status === 'NOT_SYNCED') {
@@ -88,6 +89,7 @@ export default function SyncPage() {
 
   const [groups, setGroups] = useState([]);
   const [groupPosts, setGroupPosts] = useState({});
+  const [ungroupedPosts, setUngroupedPosts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [notification, setNotification] = useState(null);
   const [expandedGroups, setExpandedGroups] = useState({});
@@ -105,39 +107,55 @@ export default function SyncPage() {
   const init = useCallback(async () => {
     setLoading(true);
     const groupsRes = await getGroups();
+    const allPostsRes = await getPosts();
     if (groupsRes.ok && groupsRes.data) {
       setGroups(groupsRes.data);
       const postsMap = {};
       const allPosts = [];
       const hierarchyMap = {};
-      await Promise.all(
-        groupsRes.data.map(async (g) => {
-          const [postsRes, hierRes] = await Promise.all([
-            getGroupPosts(g.group_id),
-            getGroupMediaHierarchy(g.group_id),
-          ]);
-          if (postsRes.ok && postsRes.data) {
-            postsMap[g.group_id] = postsRes.data;
-            allPosts.push(...postsRes.data);
-          } else {
-            postsMap[g.group_id] = [];
-          }
-          if (hierRes.ok && hierRes.data) {
-            hierarchyMap[g.group_id] = hierRes.data.zones || [];
-          } else {
-            hierarchyMap[g.group_id] = [];
-          }
-        })
-      );
+
+      // 2 requetes par groupe + 1 par poste : sans limitation cela part
+      // en plusieurs milliers d'appels simultanes et le navigateur repond
+      // net::ERR_INSUFFICIENT_RESOURCES.
+      await mapWithConcurrency(groupsRes.data, async (g) => {
+        const [postsRes, hierRes] = await Promise.all([
+          getGroupPosts(g.group_id),
+          getGroupMediaHierarchy(g.group_id),
+        ]);
+        if (postsRes.ok && postsRes.data) {
+          postsMap[g.group_id] = postsRes.data;
+          allPosts.push(...postsRes.data);
+        } else {
+          postsMap[g.group_id] = [];
+        }
+        if (hierRes.ok && hierRes.data) {
+          hierarchyMap[g.group_id] = hierRes.data.zones || [];
+        } else {
+          hierarchyMap[g.group_id] = [];
+        }
+      });
+
       setGroupPosts(postsMap);
       setGroupMediaHierarchy(hierarchyMap);
+
+      // Postes hors groupe : visibles dans la liste complete /api/v1/posts
+      // mais absents des groupes. Ils sont synchronisables individuellement.
+      const groupedIds = new Set(allPosts.map(p => p.post_id));
+      const allPostsList = allPostsRes.ok ? (allPostsRes.data || []) : [];
+      const ungrouped = allPostsList.filter(p => !groupedIds.has(p.post_id));
+      setUngroupedPosts(ungrouped);
+
+      // La page est exploitable des que groupes/postes/hierarchie sont charges.
+      // Les statuts (1 GET par poste, ~860 requetes) remontent ensuite : les
+      // attendre ici faisait rester la page en "Chargement" plusieurs minutes.
+      setLoading(false);
+
       const statuses = {};
-      await Promise.all(
-        allPosts.map(async (p) => {
-          const r = await getPostSyncStatus(p.post_id);
-          if (r.ok && r.data) statuses[p.post_id] = r.data;
-        })
-      );
+      const statusTargets = [...allPosts, ...ungrouped];
+      await mapWithConcurrency(statusTargets, async (p) => {
+        const r = await getPostSyncStatus(p.post_id);
+        if (r.ok && r.data) statuses[p.post_id] = r.data;
+      });
       setPostStatuses(statuses);
     }
     setLoading(false);
@@ -226,7 +244,11 @@ export default function SyncPage() {
         } else {
           showNotif('success', 'Synchronisation lancée.');
         }
-        await refreshGroup(groupId);
+        if (groupId) {
+          await refreshGroup(groupId);
+        } else {
+          await init();
+        }
       } else {
         showNotif('error', extractDetailMessage(result.data?.detail, 'Erreur de synchronisation.'));
       }
@@ -308,12 +330,13 @@ export default function SyncPage() {
             <div className="flex items-center gap-3 text-[#a0a7b3] text-sm py-12 justify-center">
               <Loader className="w-5 h-5 animate-spin" /> Chargement...
             </div>
-          ) : groups.length === 0 ? (
-            <div className="text-center py-16">
-              <p className="text-[#a0a7b3] text-sm">Aucun groupe configuré.</p>
-            </div>
           ) : (
-            <div className="space-y-3 max-w-5xl">
+          <div className="space-y-3 max-w-5xl">
+              {groups.length === 0 && (
+                <div className="text-center py-10">
+                  <p className="text-[#a0a7b3] text-sm">Aucun groupe configuré.</p>
+                </div>
+              )}
               {groups.map(group => {
                 const posts = groupPosts[group.group_id] || [];
                 const zones = groupMediaHierarchy[group.group_id] || [];
@@ -494,6 +517,73 @@ export default function SyncPage() {
                   </div>
                 );
               })}
+
+              {ungroupedPosts.length > 0 && (
+                <div className="bg-[#111418]/80 border border-white/10 rounded-lg overflow-hidden">
+                  <div className="w-full flex items-center justify-between px-5 py-4">
+                    <div className="flex items-center gap-3">
+                      <MonitorPlay className="w-4 h-4 text-[#f6c200] opacity-70" />
+                      <div className="text-left">
+                        <p className="text-sm font-semibold text-white">Postes sans groupe</p>
+                        <p className="text-xs text-[#a0a7b3] mt-0.5">
+                          {ungroupedPosts.length} {ungroupedPosts.length > 1 ? 'postes' : 'poste'} hors de tout groupe
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="border-t border-white/5">
+                    {ungroupedPosts.map(post => {
+                      const status = postStatuses[post.post_id];
+                      const lastSync = status?.completed_at;
+                      return (
+                        <div key={post.post_id} className="flex items-center justify-between px-5 py-2.5 hover:bg-white/[0.01] transition-colors border-t border-white/[0.03]">
+                          <div className="flex items-center gap-4">
+                            <div>
+                              <p className="text-xs text-white font-medium">{post.code}</p>
+                              <p className="text-[10px] text-[#a0a7b3]">{post.name}</p>
+                            </div>
+                            <PostSyncBadge status={status} />
+                            {lastSync && (
+                              <span className="text-[10px] text-[#a0a7b3]">
+                                {new Date(lastSync).toLocaleString('fr-FR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <select
+                              value={postSyncMode[post.post_id] || 'now'}
+                              onChange={(e) => setPostSyncMode(prev => ({ ...prev, [post.post_id]: e.target.value }))}
+                              className="px-2 py-1 bg-[#0f1217] border border-white/10 rounded-lg text-xs text-white focus:outline-none focus:border-[#f6c200]/50"
+                            >
+                              <option value="now">Maintenant</option>
+                              <option value="schedule">Programmer</option>
+                            </select>
+                            {postSyncMode[post.post_id] === 'schedule' && (
+                              <input
+                                type="datetime-local"
+                                value={postSyncTime[post.post_id] || ''}
+                                onChange={(e) => setPostSyncTime(prev => ({ ...prev, [post.post_id]: e.target.value }))}
+                                className="px-2 py-1 bg-[#0f1217] border border-white/10 rounded-lg text-xs text-white focus:outline-none focus:border-[#f6c200]/50"
+                              />
+                            )}
+                            <button
+                              onClick={() => handleSyncPost(post.post_id, null)}
+                              disabled={syncingPosts[post.post_id]}
+                              className="flex items-center gap-1 px-2 py-1 text-[10px] font-semibold rounded transition-colors hover:opacity-90 disabled:opacity-50"
+                              style={{ background: 'linear-gradient(135deg, #f6c200, #ffdb4d)' }}
+                            >
+                              {syncingPosts[post.post_id]
+                                ? <Loader className="w-2.5 h-2.5 text-[#111418] animate-spin" />
+                                : <RefreshCw className="w-2.5 h-2.5 text-[#111418]" />}
+                              <span className="text-[#111418]">Synchroniser</span>
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </main>

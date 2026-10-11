@@ -5,7 +5,6 @@ const pwOk = (v) => v && v.length >= 8 && v.length <= 14 && /[A-Za-z]/.test(v) &
 export default function AdminFormModal({ admin, clients, onSave, onCancel }) {
   const [login, setLogin] = useState(admin?.login || '');
   const [userCode, setUserCode] = useState(admin?.user_code || '');
-  const [email, setEmail] = useState(admin?.email || '');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [isActive, setIsActive] = useState(admin ? admin.is_active : true);
@@ -46,7 +45,6 @@ export default function AdminFormModal({ admin, clients, onSave, onCancel }) {
     const payload = {
       user_code: userCode.trim() || null,
       login: login.trim(),
-      email: email.trim() || null,
       is_active: isActive,
       client_codes: selected,
     };
@@ -89,11 +87,6 @@ export default function AdminFormModal({ admin, clients, onSave, onCancel }) {
             <input type="text" value={userCode} onChange={e => setUserCode(e.target.value)}
               className={inputClass} />
           </div>
-          <div className="col-span-2">
-            <label className="block text-xs text-[#a0a7b3] mb-1">Email</label>
-            <input type="email" value={email} onChange={e => setEmail(e.target.value)}
-              className={inputClass} />
-          </div>
           {!editing && (
             <>
               <div>
@@ -119,11 +112,19 @@ export default function AdminFormModal({ admin, clients, onSave, onCancel }) {
           <h4 className="text-white font-semibold text-sm mb-1">Clients affectés</h4>
           <p className="text-[11px] text-[#a0a7b3] mb-3">
             Cet admin n'aura accès qu'aux clients sélectionnés (leurs sites, postes, médias et utilisateurs).
+            Sans sélection, il sera rattaché à son propre code client.
           </p>
           {clients.length === 0 ? (
             <p className="text-sm text-[#a0a7b3] py-4 text-center">Aucun client disponible. Créez d'abord des utilisateurs avec un code client.</p>
           ) : (
             <>
+              {selected.length === 0 && (
+                <p className="mb-3 px-3 py-2 rounded text-xs border bg-amber-950/60 border-amber-700/40 text-amber-300">
+                  Aucun client sélectionné : l'admin sera rattaché automatiquement au client
+                  {userCode.trim() ? ` « ${userCode.trim().toUpperCase()} »` : ' par défaut'}.
+                  Sans client, il ne pourra créer ni voir aucun utilisateur.
+                </p>
+              )}
               <div className="flex gap-3 mb-3">
                 <button type="button" onClick={() => toggleAll(true)} className="text-xs text-[#f6c200] hover:underline">Tout sélectionner</button>
                 <span className="text-[#a0a7b3] text-xs">|</span>

@@ -1,10 +1,13 @@
 import { useState, useEffect } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { LogOut, ArrowLeft, Save, RotateCcw, Eye, EyeOff } from 'lucide-react';
+import { LogOut, ArrowLeft, Save, RotateCcw, Eye, EyeOff, Plus } from 'lucide-react';
 import ThemeToggle from '../components/ThemeToggle';
 import NavBar from '../components/NavBar';
+import PasswordRulesHint from '../components/PasswordRulesHint';
+import { validatePassword } from '../utils/passwordRules';
 import apiService from '../services/api';
+import { createClient } from '../services/admins';
 
 const ZONES = [1, 2, 3, 4, 5, 6, 7, 8];
 
@@ -15,10 +18,14 @@ export default function UserForm() {
   const navigate = useNavigate();
   const [profiles, setProfiles] = useState([]);
   const [admins, setAdmins] = useState([]);
+  const [myClients, setMyClients] = useState([]);
+  const [clientsLoaded, setClientsLoaded] = useState(false);
+  const [fieldError, setFieldError] = useState(null);
   const [allPermissions, setAllPermissions] = useState([]);
   const [groupsList, setGroupsList] = useState([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [creatingClient, setCreatingClient] = useState(false);
   const [notification, setNotification] = useState(null);
 
   const [form, setForm] = useState({
@@ -28,8 +35,8 @@ export default function UserForm() {
     password_confirm: '',
     profile_id: '',
     admin_id: null,
+    admin_code: '',
     is_active: true,
-    requires_activation: false,
     zones: [],
     groups: [],
     permissions: [],
@@ -58,6 +65,20 @@ export default function UserForm() {
         const adminsRes = await apiService.get('/api/v1/admins');
         adminList = adminsRes.ok ? (adminsRes.data?.admins || []) : [];
         setAdmins(adminList);
+      } else {
+        // Un Admin classique ne peut rattacher un compte qu'a SES propres
+        // clients. La saisie reste LIBRE (le backend refuse tout code hors
+        // perimetre avec un 400 explicite) ; cette liste ne sert que de
+        // suggestions et de source de verite pour le message « aucun client ».
+        const clientsRes = await apiService.get('/api/v1/clients');
+        // L'API renvoie `client_code` (et non `code_client`) : lire le mauvais
+        // champ rendait chaque option a value='' et le select inutilisable.
+        const list = clientsRes.ok ? (clientsRes.data?.clients || []) : [];
+        setMyClients(list);
+        setClientsLoaded(clientsRes.ok);
+        if (!isEdit && list.length === 1) {
+          setForm(prev => ({ ...prev, user_code: list[0].client_code || '' }));
+        }
       }
 
       if (isEdit) {
@@ -71,7 +92,6 @@ export default function UserForm() {
             password_confirm: '',
             profile_id: u.profile_id,
             is_active: u.is_active,
-            requires_activation: u.is_activated === false,
             admin_id: u.admin_id || '',
             admin_code: adminList.find(a => String(a.user_id) === String(u.admin_id))?.user_code || '',
             zones: (u.zones || []).filter(z => z.is_allowed).map(z => z.zone_number),
@@ -89,6 +109,45 @@ export default function UserForm() {
     }
     init();
   }, [id, isEdit]);
+
+  const selectedProfile = profiles.find(p => String(p.profile_id) === String(form.profile_id))?.name || '';
+  const needsAdmin = isSuperAdmin && selectedProfile && selectedProfile !== 'Administrateur';
+  const resolvedAdmin = needsAdmin ? resolveAdminCode(form.admin_code) : null;
+
+  // Admin classique : un code client inconnu n'est plus une impasse, il peut
+  // être créé à la volée (POST /api/v1/clients) puis rattaché à l'admin.
+  const myClientCodes = myClients.map(c => (c.client_code || '').trim().toUpperCase());
+  const typedClientCode = (form.user_code || '').trim().toUpperCase();
+  const unknownClientCode = !isSuperAdmin && typedClientCode && !myClientCodes.includes(typedClientCode);
+
+  function addMyClient(code, data) {
+    setMyClients(prev => prev.some(x => (x.client_code || '').trim().toUpperCase() === code)
+      ? prev
+      : [...prev, { client_id: data?.client_id, client_code: data?.client_code || code, client_name: data?.client_name }]);
+  }
+
+  async function handleCreateClient() {
+    if (!typedClientCode) return;
+    setCreatingClient(true);
+    setFieldError(null);
+    try {
+      const res = await createClient({ client_code: typedClientCode });
+      if (res.ok) {
+        addMyClient(typedClientCode, res.data);
+        setNotification({ type: 'success', text: `Client ${typedClientCode} créé.` });
+      } else if (res.status === 400) {
+        // Le client existe déjà côté serveur : rien à faire, on peut continuer.
+        addMyClient(typedClientCode, null);
+        setNotification({ type: 'success', text: `Client ${typedClientCode} prêt.` });
+      } else {
+        setNotification({ type: 'error', text: res.data?.detail || `Impossible de créer le client « ${typedClientCode} ».` });
+      }
+    } catch {
+      setNotification({ type: 'error', text: 'Erreur de connexion.' });
+    } finally {
+      setCreatingClient(false);
+    }
+  }
 
   function updateField(key, value) {
     setForm(prev => {
@@ -141,7 +200,7 @@ export default function UserForm() {
     setSaving(true);
     setNotification(null);
 
-    if (needsAdmin && form.admin_code.trim() && !resolvedAdmin) {
+    if (needsAdmin && form.admin_code?.trim() && !resolvedAdmin) {
       setSaving(false);
       setNotification({ type: 'error', text: 'Code admin introuvable : saisissez un code admin existant.' });
       return;
@@ -151,15 +210,51 @@ export default function UserForm() {
       ? (resolvedAdmin ? resolvedAdmin.user_id : null)
       : (isSuperAdmin ? (form.admin_id || null) : (currentUser?.user_id || null));
 
+    setFieldError(null);
+    // Code client saisi librement : on normalise (trim + majuscules) comme le
+    // font les comparaisons cote backend.
+    const userCode = (form.user_code || '').trim().toUpperCase();
+
+    // Politique de mot de passe verifiee AVANT l'appel : c'est elle qui
+    // provoquait le 422 sur POST /api/v1/users, affiche ensuite comme
+    // « Value error, password ... » alors que la saisie etait simplement
+    // hors regles. Un administrateur qui cree 20 comptes ne doit pas decouvrir
+    // la contrainte par une panne serveur.
+    if (!isEdit && form.password) {
+      const invalid = validatePassword(form.password);
+      if (invalid) {
+        setSaving(false);
+        setFieldError(invalid);
+        setNotification({ type: 'error', text: invalid });
+        return;
+      }
+    }
+
+    // Admin classique + code client inconnu : on crée le client via
+    // POST /api/v1/clients avant le compte (sinon le backend le refuse comme
+    // hors périmètre). Un 400 « existe déjà » n'est pas bloquant.
+    if (!isEdit && !isSuperAdmin && userCode && !myClientCodes.includes(userCode)) {
+      setCreatingClient(true);
+      const created = await createClient({ client_code: userCode });
+      setCreatingClient(false);
+      if (!created.ok && created.status !== 400) {
+        setSaving(false);
+        const detail = created.data?.detail || `Impossible de créer le client « ${userCode} ».`;
+        setFieldError(detail);
+        setNotification({ type: 'error', text: detail });
+        return;
+      }
+      if (created.ok) addMyClient(userCode, created.data);
+    }
+
     try {
       let result;
       if (isEdit) {
         const payload = {
-          user_code: form.user_code,
+          user_code: userCode,
           login: form.login,
           profile_id: parseInt(form.profile_id),
           is_active: form.is_active,
-          requires_activation: form.requires_activation,
           admin_id: adminIdToSend,
           zones: form.zones,
           permissions: form.permissions,
@@ -167,13 +262,12 @@ export default function UserForm() {
         result = await apiService.put(`/api/v1/users/${id}`, payload);
       } else {
         result = await apiService.post('/api/v1/users', {
-          user_code: form.user_code,
+          user_code: userCode,
           login: form.login,
           password: form.password,
           password_confirm: form.password_confirm,
           profile_id: parseInt(form.profile_id),
           is_active: form.is_active,
-          requires_activation: form.requires_activation,
           admin_id: adminIdToSend,
           zones: form.zones,
           permissions: form.permissions,
@@ -182,10 +276,14 @@ export default function UserForm() {
 
       if (result.ok) {
         setNotification({ type: 'success', text: result.data?.message || 'Enregistré avec succès.' });
-        setTimeout(() => navigate('/users'), 1500);
+        setTimeout(() => navigate('/users', { state: { created: true } }), 1500);
       } else {
         const msg = result.data?.detail || 'Erreur lors de l\'enregistrement.';
-        setNotification({ type: 'error', text: Array.isArray(msg) ? msg.map(e => e.msg).join(', ') : msg });
+        const text = Array.isArray(msg) ? msg.map(e => e.msg).join(', ') : msg;
+        // Le 400 du perimetre client s'affiche sous le champ pour que l'admin
+        // voie exactement le refus du backend, pas un echec silencieux.
+        if (result.status === 400) setFieldError(text);
+        setNotification({ type: 'error', text });
       }
     } catch {
       setNotification({ type: 'error', text: 'Erreur de connexion.' });
@@ -197,6 +295,11 @@ export default function UserForm() {
   async function handleResetPassword() {
     if (resetForm.new_password !== resetForm.password_confirm) {
       setNotification({ type: 'error', text: 'Les mots de passe ne correspondent pas.' });
+      return;
+    }
+    const invalid = validatePassword(resetForm.new_password);
+    if (invalid) {
+      setNotification({ type: 'error', text: invalid });
       return;
     }
     setResetting(true);
@@ -223,9 +326,6 @@ export default function UserForm() {
   const menuPerms = allPermissions.filter(p => ['menu_conception', 'menu_sync', 'menu_media', 'menu_config'].includes(p.code));
   const userPerms = allPermissions.filter(p => ['user_list', 'user_create', 'user_update', 'user_delete'].includes(p.code));
   const sitePerms = allPermissions.filter(p => ['list_sites_posts', 'create_site', 'update_site', 'delete_site', 'create_post', 'update_post', 'delete_post'].includes(p.code));
-  const selectedProfile = profiles.find(p => String(p.profile_id) === String(form.profile_id))?.name || '';
-  const needsAdmin = isSuperAdmin && selectedProfile && selectedProfile !== 'Administrateur';
-  const resolvedAdmin = needsAdmin ? resolveAdminCode(form.admin_code) : null;
 
   if (loading) {
     return (
@@ -264,6 +364,7 @@ export default function UserForm() {
                 className="w-full bg-[#111418] text-white placeholder-[#a0a7b3] px-3 py-2.5 rounded-lg border border-white/10 text-sm focus:outline-none focus:border-[#f6c200]/50" />
               <input type="password" placeholder="Confirmer le mot de passe" value={resetForm.password_confirm} onChange={(e) => setResetForm(p => ({ ...p, password_confirm: e.target.value }))}
                 className="w-full bg-[#111418] text-white placeholder-[#a0a7b3] px-3 py-2.5 rounded-lg border border-white/10 text-sm focus:outline-none focus:border-[#f6c200]/50" />
+              <PasswordRulesHint value={resetForm.new_password} />
             </div>
             <div className="flex gap-3 justify-end mt-6">
               <button onClick={() => setShowResetModal(false)} className="px-4 py-2 bg-[#2a2f36] text-white/80 text-sm rounded-lg hover:bg-[#3a3646] border border-white/5">Annuler</button>
@@ -314,10 +415,46 @@ export default function UserForm() {
                 <h3 className="text-[#f6c200] text-sm font-semibold uppercase tracking-wider mb-4 pb-2 border-b border-white/5">Authentification</h3>
                 <div className="grid grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-xs text-[#a0a7b3] mb-1.5">Code client</label>
-                    <input type="text" value={form.user_code} onChange={(e) => updateField('user_code', e.target.value)}
-                      placeholder="Code attribué au client"
-                      className="w-full bg-[#1a1f24] text-white placeholder-[#a0a7b3] px-3 py-2.5 rounded-lg border border-white/10 text-sm focus:outline-none focus:border-[#f6c200]/50" />
+                    <label className="block text-xs text-[#a0a7b3] mb-1.5">
+                      Code client {isSuperAdmin && <span className="text-red-400">*</span>}
+                    </label>
+                    {isSuperAdmin ? (
+                      <input type="text" value={form.user_code} onChange={(e) => updateField('user_code', e.target.value)}
+                        placeholder="Code attribué au client"
+                        className="w-full bg-[#1a1f24] text-white placeholder-[#a0a7b3] px-3 py-2.5 rounded-lg border border-white/10 text-sm focus:outline-none focus:border-[#f6c200]/50" />
+                    ) : (
+                      <>
+                        <input type="text" value={form.user_code} list="assigned-clients"
+                          onChange={(e) => { setFieldError(null); updateField('user_code', e.target.value); }}
+                          placeholder="Saisissez le code client"
+                          className={`w-full bg-[#1a1f24] text-white placeholder-[#a0a7b3] px-3 py-2.5 rounded-lg border text-sm focus:outline-none focus:border-[#f6c200]/50 ${fieldError ? 'border-red-500/60' : 'border-white/10'}`} />
+                        <datalist id="assigned-clients">
+                          {myClients.map(c => (
+                            <option key={c.client_id ?? c.client_code} value={c.client_code} />
+                          ))}
+                        </datalist>
+                        {fieldError && (
+                          <p className="text-[11px] text-red-400 mt-1">{fieldError}</p>
+                        )}
+                        {unknownClientCode && (
+                          <button type="button" onClick={handleCreateClient} disabled={creatingClient}
+                            className="mt-1 flex items-center gap-1 text-[11px] text-[#f6c200] hover:underline disabled:opacity-50">
+                            <Plus className="w-3 h-3" />
+                            {creatingClient ? 'Création du client...' : `Créer le client « ${typedClientCode} »`}
+                          </button>
+                        )}
+                        {!unknownClientCode && clientsLoaded && myClients.length === 0 && (
+                          <p className="text-[11px] text-[#a0a7b3] mt-1">
+                            Aucun client ne vous est affecté : saisissez le code d'un nouveau client pour le créer.
+                          </p>
+                        )}
+                        {!unknownClientCode && clientsLoaded && myClients.length > 0 && (
+                          <p className="text-[11px] text-[#a0a7b3] mt-1">
+                            Vos clients : {myClients.map(c => c.client_code).join(', ')}
+                          </p>
+                        )}
+                      </>
+                    )}
                   </div>
                   <div>
                     <label className="block text-xs text-[#a0a7b3] mb-1.5">Login <span className="text-red-400">*</span></label>
@@ -342,8 +479,8 @@ export default function UserForm() {
                               setForm(prev => ({ ...prev, admin_code: code, admin_id: matched ? matched.user_id : '' }));
                             }}
                             placeholder="Code admin responsable"
-                            className={`w-full bg-[#1a1f24] text-white placeholder-[#a0a7b3] px-3 py-2.5 rounded-lg border text-sm focus:outline-none focus:border-[#f6c200]/50 ${form.admin_code.trim() && !resolvedAdmin ? 'border-red-500/60' : 'border-white/10'}`} />
-                          {form.admin_code.trim() && !resolvedAdmin && (
+              className={`w-full bg-[#1a1f24] text-white placeholder-[#a0a7b3] px-3 py-2.5 rounded-lg border text-sm focus:outline-none focus:border-[#f6c200]/50 ${form.admin_code?.trim() && !resolvedAdmin ? 'border-red-500/60' : 'border-white/10'}`} />
+              {form.admin_code?.trim() && !resolvedAdmin && (
                             <p className="text-[11px] text-red-400 mt-1">Code admin introuvable : saisissez un code admin existant.</p>
                           )}
                           {resolvedAdmin && (
@@ -360,19 +497,6 @@ export default function UserForm() {
                       </button>
                       <span className="text-sm text-white">{form.is_active ? 'Actif' : 'Inactif'}</span>
                     </div>
-                  </div>
-                  <div>
-                    <label className="block text-xs text-[#a0a7b3] mb-1.5">Compte à activer par un code de sérialisation</label>
-                    <div className="flex items-center gap-3 py-2.5">
-                      <button type="button" onClick={() => updateField('requires_activation', !form.requires_activation)}
-                        className={`w-10 h-5 rounded-full transition-colors relative ${form.requires_activation ? 'bg-[#f6c200]' : 'bg-[#2a2f36]'}`}>
-                        <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${form.requires_activation ? 'left-5.5 translate-x-0' : 'left-0.5'}`} />
-                      </button>
-                      <span className="text-sm text-white">{form.requires_activation ? 'Oui' : 'Non'}</span>
-                    </div>
-                    {form.requires_activation && (
-                      <p className="text-[11px] text-[#f6c200]">Le client devra saisir son code de sérialisation avant de pouvoir accéder à l'application.</p>
-                    )}
                   </div>
                   {!isEdit && (
                     <>
@@ -396,6 +520,7 @@ export default function UserForm() {
                           </button>
                         </div>
                       </div>
+                      <PasswordRulesHint value={form.password} />
                     </>
                   )}
                 </div>

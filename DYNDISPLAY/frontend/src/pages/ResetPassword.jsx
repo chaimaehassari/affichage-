@@ -3,6 +3,8 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { resetPassword } from '../services/auth';
 import { extractDetailMessage } from '../services/api';
+import { validatePassword } from '../utils/passwordRules';
+import PasswordRulesHint from '../components/PasswordRulesHint';
 import { Monitor, Lock, KeyRound, Eye, EyeOff } from 'lucide-react';
 import ThemeToggle from '../components/ThemeToggle';
 
@@ -29,6 +31,14 @@ export default function ResetPassword() {
       setError('Les mots de passe ne correspondent pas.');
       return;
     }
+    // Meme politique que les autres ecrans (voir utils/passwordRules.js) :
+    // le placeholder « 8-14 car. » ne rappelait ni la lettre, ni le chiffre,
+    // ni le caractere special, et le backend répondait 422.
+    const invalid = validatePassword(newPassword, 'Le nouveau mot de passe est obligatoire.');
+    if (invalid) {
+      setError(invalid);
+      return;
+    }
     setSubmitting(true);
     setError('');
     setMessage('');
@@ -36,7 +46,7 @@ export default function ResetPassword() {
       const result = await resetPassword(token, newPassword, confirmPassword);
       if (result.ok && result.data) {
         if (result.data.access_token && result.data.user) {
-          applySession(result.data.access_token, result.data.user);
+          applySession(result.data.access_token, result.data.user, result.data.refresh_token);
           navigate('/', { replace: true });
           return;
         }
@@ -110,6 +120,7 @@ export default function ResetPassword() {
               disabled={submitting}
               className="w-full bg-[#1a1f24] text-white placeholder-[#a0a7b3] pl-10 pr-11 py-3 rounded-lg border border-white/6 focus:border-[#f6c200] focus:outline-none focus:ring-1 focus:ring-[#f6c200]/50 transition-all text-sm disabled:opacity-50"
             />
+            <PasswordRulesHint value={newPassword} className="mt-2 pl-2" />
             <button
               type="button"
               tabIndex={-1}

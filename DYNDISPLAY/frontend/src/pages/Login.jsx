@@ -3,7 +3,6 @@ import { Navigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { Monitor, Lock, User, KeySquare, Eye, EyeOff } from 'lucide-react';
 import ThemeToggle from '../components/ThemeToggle';
-import AccountActivation from '../components/AccountActivation';
 
 export default function Login() {
   const { login, isAuthenticated, error } = useAuth();
@@ -12,22 +11,9 @@ export default function Login() {
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const [pendingActivation, setPendingActivation] = useState(null);
 
   if (isAuthenticated) {
     return <Navigate to="/" replace />;
-  }
-
-  if (pendingActivation) {
-    return (
-      <AccountActivation
-        login={pendingActivation.username}
-        password={pendingActivation.password}
-        clientCode={pendingActivation.clientCode}
-        accountCode={pendingActivation.accountCode}
-        onCancel={() => setPendingActivation(null)}
-      />
-    );
   }
 
   const canSubmit = username.trim() !== '' && password !== '' && !submitting;
@@ -36,16 +22,8 @@ export default function Login() {
     e.preventDefault();
     if (!canSubmit) return;
     setSubmitting(true);
-    const result = await login(username.trim(), password, clientCode.trim());
+    await login(username.trim(), password, clientCode.trim());
     setSubmitting(false);
-    if (result && result.needsActivation) {
-      setPendingActivation({
-        username: username.trim(),
-        password,
-        clientCode: clientCode.trim(),
-        accountCode: result.accountCode,
-      });
-    }
   }
 
   function handleCancel() {

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { getSettings } from '../services/settings';
+import { getSessionTimeout } from '../services/settings';
 
 export default function SessionLock() {
   const { user, logout, isAuthenticated } = useAuth();
@@ -13,7 +13,10 @@ export default function SessionLock() {
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const result = await getSettings();
+      // Route dédiée (require_admin) : GET /settings est réservé au
+      // Super Admin et renvoyait 403 pour un Admin classique, qui perdait
+      // donc silencieusement son verrouillage de session.
+      const result = await getSessionTimeout();
       if (!cancelled && result.ok && result.data) {
         const minutes = parseInt(result.data.session_timeout_minutes || 0, 10);
         setTimeoutMinutes(minutes);

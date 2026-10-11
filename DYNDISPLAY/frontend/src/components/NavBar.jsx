@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { FileText, ChevronDown, Users, MonitorPlay, Building2, LayoutGrid, Monitor, Settings, RefreshCw, Eye, HardDrive } from 'lucide-react';
+import { FileText, ChevronDown, Users, MonitorPlay, Building2, LayoutGrid, Monitor, Settings, RefreshCw, Eye, HardDrive, BarChart3, Tv, Shield } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
+import { isNavItemVisible, PLATFORM_NAV_ITEMS } from '../utils/navbarItems';
 
 const fichiersItems = [
   { id: 'users', label: 'Liste des utilisateurs', icon: Users, permission: 'user_list' },
@@ -12,6 +13,7 @@ const fichiersItems = [
 const displayItems = [
   { id: 'config', label: 'Configuration', icon: Monitor, route: '/display-config', permission: 'menu_config' },
   { id: 'supervision', label: 'Supervision', icon: Eye, route: '/supervision', permission: 'menu_config' },
+  { id: 'diffusion-report', label: 'Rapport de diffusion', icon: Tv, route: '/diffusion-report', permission: 'menu_config' },
 ];
 
 const mainItems = [
@@ -51,16 +53,28 @@ export default function NavBar() {
     setOpenMenu(prev => (prev === name ? null : name));
   }
 
-  function isItemVisible(item) {
-    if (item.superAdminOnly) return !!isSuperAdmin;
-    if (!item.permission) return true;
-    if (user?.profile_name === 'Administrateur') return true;
-    return hasPermission(item.permission);
+  // Le menu dépend de l'utilisateur chargé. Tant que le profil n'est pas
+  // disponible, on affiche un squelette stable plutôt qu'un menu vide qui
+  // « clignote » puis se remplit.
+  if (!user) {
+    return (
+      <nav className="px-8 bg-[#111418]/40 border-b border-white/5">
+        <ul className="flex items-center gap-2 py-2.5" aria-busy="true">
+          {[0, 1, 2, 3].map((i) => (
+            <li key={i} className="h-4 w-24 rounded bg-white/5 animate-pulse" />
+          ))}
+        </ul>
+      </nav>
+    );
   }
+
+  const navCtx = { isSuperAdmin, hasPermission };
+  const isItemVisible = (item) => isNavItemVisible(item, navCtx);
 
   const fichiersVisible = fichiersItems.filter(isItemVisible);
   const displayVisible = displayItems.filter(isItemVisible);
   const mainVisible = mainItems.filter(isItemVisible);
+  const platformVisible = PLATFORM_NAV_ITEMS.filter(isItemVisible);
   const showParametrage = hasPermission('menu_config') || hasPermission('menu_sync');
 
   return (
@@ -113,6 +127,19 @@ export default function NavBar() {
             </li>
           );
         })}
+
+        {platformVisible.map((tab) => (
+          <li key={tab.id}>
+            <button
+              type="button"
+              onClick={() => go(tab.route)}
+              className="flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium transition-colors text-[#a0a7b3] hover:text-white hover:bg-white/5"
+            >
+              <Shield className="w-3.5 h-3.5" />
+              {tab.label}
+            </button>
+          </li>
+        ))}
 
         {displayVisible.length > 0 && (
         <li className="relative">

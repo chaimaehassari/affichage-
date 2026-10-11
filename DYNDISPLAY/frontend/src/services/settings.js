@@ -14,10 +14,6 @@ export async function updateSettings(data) {
   return apiService.put(`${PREFIX}/settings`, data);
 }
 
-export async function updateLicenses(code, sites, posts) {
-  return apiService.post(`${PREFIX}/settings/license/update`, { code, sites, posts });
-}
-
 export async function getFtpProfiles() {
   return apiService.get(`${PREFIX}/ftp-profiles`);
 }
@@ -50,10 +46,8 @@ export async function verifyAccessPassword(password) {
   return apiService.post(`${PREFIX}/settings/verify-access`, { password });
 }
 
-export async function getAccountDevices() {
-  return apiService.get(`${PREFIX}/settings/accounts/devices`);
+export async function getSessionTimeout() {
+  return apiService.get(`${PREFIX}/settings/session-timeout`);
 }
 
-export async function revokeDeviceAccount(userId) {
-  return apiService.post(`${PREFIX}/settings/accounts/${userId}/revoke-device`);
-}
+

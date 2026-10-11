@@ -16,7 +16,7 @@ export default function SettingsAccessModal({ onSuccess, onCancel, expired }) {
       if (result.ok && result.data?.valid) {
         onSuccess();
       } else {
-        setError('Code incorrect. Contactez le support technique.');
+        setError('Mot de passe incorrect.');
       }
     } catch {
       setError('Erreur de connexion.');
@@ -30,7 +30,7 @@ export default function SettingsAccessModal({ onSuccess, onCancel, expired }) {
       <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" />
       <div className="relative bg-[#111418] border border-white/10 rounded-xl shadow-2xl w-full max-w-sm" onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between px-5 py-3 border-b border-white/10">
-          <h3 className="text-white font-semibold text-sm flex items-center gap-2">
+            <h3 className="text-white font-semibold text-sm flex items-center gap-2">
             <Shield className="w-4 h-4 text-[#f6c200]" /> Authentification requise
           </h3>
           <button onClick={onCancel} className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-white/10 text-[#a0a7b3] hover:text-white transition-colors">
@@ -38,6 +38,9 @@ export default function SettingsAccessModal({ onSuccess, onCancel, expired }) {
           </button>
         </div>
         <form onSubmit={handleSubmit} className="p-5 space-y-4">
+          <p className="text-xs text-[#a0a7b3]">
+            Saisissez votre mot de passe de connexion pour ouvrir les paramètres.
+          </p>
           <div className="relative">
             <Key className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[#a0a7b3]" />
             <input
@@ -46,7 +49,8 @@ export default function SettingsAccessModal({ onSuccess, onCancel, expired }) {
               onChange={e => { setPassword(e.target.value); setError(''); }}
               autoFocus
               maxLength={64}
-              autoComplete="off"
+              autoComplete="current-password"
+              placeholder="Mot de passe"
               className="w-full pl-10 pr-4 py-2.5 bg-[#0f1217] border border-white/10 rounded-lg text-white text-sm tracking-[0.3em] text-center font-mono focus:outline-none focus:border-[#f6c200]/50 transition-colors"
             />
           </div>

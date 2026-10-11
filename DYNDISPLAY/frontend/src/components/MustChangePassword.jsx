@@ -2,15 +2,14 @@ import { useState } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import { changePassword } from '../services/settings';
 import { extractDetailMessage } from '../services/api';
-import { Monitor, Lock, KeyRound, Eye, EyeOff, AlertTriangle, LogOut } from 'lucide-react';
+import { Monitor, Lock, KeyRound, Eye, EyeOff, AlertTriangle, LogOut, Check } from 'lucide-react';
 import ThemeToggle from './ThemeToggle';
+import PasswordRulesHint from './PasswordRulesHint';
 
-const PASSWORD_RULES = [
-  'Entre 8 et 14 caractères',
-  'Au moins une lettre et un chiffre',
-  'Au moins un caractère spécial (!@#$%^&*...)',
-  'Différent du login',
-];
+// Règles issues de la validation backend (voir utils/passwordRules.js). Le
+// texte fixe est remplacé par le composant à coches : la règle « différent du
+// login » reste un contrôle propre à cet écran, il n'est pas dans la politique.
+const EXTRA_RULE = 'Différent du login';
 
 export default function MustChangePassword() {
   const { user, logout, refreshUser } = useAuth();
@@ -21,11 +20,14 @@ export default function MustChangePassword() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
 
+  const sameAsLogin = newPassword !== '' && newPassword === user?.login;
+
   const canSubmit =
     currentPassword !== '' &&
     newPassword !== '' &&
     confirmPassword !== '' &&
     newPassword === confirmPassword &&
+    !sameAsLogin &&
     !submitting;
 
   async function handleSubmit(e) {
@@ -101,12 +103,20 @@ export default function MustChangePassword() {
             <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
             <span>Votre mot de passe doit respecter les règles suivantes :</span>
           </p>
-          <ul className="mt-2 space-y-1">
-            {PASSWORD_RULES.map((rule, i) => (
-              <li key={i} className="flex items-center gap-2 text-xs text-[#a0a7b3]">
-                <span className="text-[#f6c200]">•</span> {rule}
-              </li>
-            ))}
+          <PasswordRulesHint value={newPassword} className="mt-2" />
+          <ul className="mt-1 space-y-1">
+            <li
+              className={`flex items-center gap-1.5 text-xs transition-colors ${
+                sameAsLogin ? 'text-[#a0a7b3]' : 'text-emerald-400/90'
+              }`}
+            >
+              <span className="w-3.5 shrink-0">
+                {!sameAsLogin && (
+                  <Check className="w-3.5 h-3.5" strokeWidth={3} aria-hidden="true" />
+                )}
+              </span>
+              {EXTRA_RULE}
+            </li>
           </ul>
         </div>
 

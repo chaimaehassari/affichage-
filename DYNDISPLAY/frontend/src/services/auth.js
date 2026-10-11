@@ -31,14 +31,3 @@ export async function resetPassword(token, newPassword, passwordConfirm) {
     password_confirm: passwordConfirm,
   });
 }
-
-export async function activateAccount(code) {
-  return apiService.post(`${AUTH_PREFIX}/activate`, { code });
-}
-
-export async function activateAccountDevice(login, activationCode) {
-  return apiService.post(`${AUTH_PREFIX}/activate-account`, {
-    login,
-    activation_code: activationCode,
-  });
-}

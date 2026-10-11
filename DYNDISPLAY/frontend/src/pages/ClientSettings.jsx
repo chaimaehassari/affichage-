@@ -1,24 +1,20 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { LogOut, Key, ShieldCheck, Building2, MonitorPlay, CalendarCheck, RefreshCw, KeySquare } from 'lucide-react';
+import { LogOut, Key, ShieldCheck, Building2 } from 'lucide-react';
 import ThemeToggle from '../components/ThemeToggle';
 import NavBar from '../components/NavBar';
 import { changePassword } from '../services/settings';
 import { extractDetailMessage } from '../services/api';
 
 export default function ClientSettings() {
-  const { logout, user, activate } = useAuth();
+  const { logout, user } = useAuth();
   const navigate = useNavigate();
 
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [changingPassword, setChangingPassword] = useState(false);
-  const [limitSites, setLimitSites] = useState(user?.sites_limit ?? '');
-  const [limitPosts, setLimitPosts] = useState(user?.posts_limit ?? '');
-  const [limitCode, setLimitCode] = useState('');
-  const [updatingLimits, setUpdatingLimits] = useState(false);
   const [notification, setNotification] = useState(null);
 
   function notify(type, text) {
@@ -56,34 +52,6 @@ export default function ClientSettings() {
       notify('error', 'Erreur de connexion.');
     }
     setChangingPassword(false);
-  }
-
-  const activatedAt = user?.activated_at ? new Date(user.activated_at).toLocaleString('fr-FR') : null;
-
-  async function handleUpdateLimits() {
-    const sites = parseInt(limitSites, 10);
-    const posts = parseInt(limitPosts, 10);
-    if (!Number.isInteger(sites) || sites < 0 || !Number.isInteger(posts) || posts < 0) {
-      notify('error', 'Saisissez des nombres de sites et de posts valides.');
-      return;
-    }
-    if (!limitCode.trim()) {
-      notify('error', 'Le nouveau code de sérialisation est obligatoire pour confirmer le changement.');
-      return;
-    }
-    setUpdatingLimits(true);
-    try {
-      const result = await activate(limitCode.replace(/[^A-Z0-9]/g, ''));
-      if (result.success) {
-        notify('success', 'Vos limites ont été mises à jour.');
-        setLimitCode('');
-      } else {
-        notify('error', extractDetailMessage(result.error, 'Code de sérialisation invalide.'));
-      }
-    } catch {
-      notify('error', 'Erreur de connexion.');
-    }
-    setUpdatingLimits(false);
   }
 
   return (
@@ -133,69 +101,10 @@ export default function ClientSettings() {
                     </div>
                     <span className="text-white font-mono">{user.user_code}</span>
                   </div>
-                  <div className="flex items-center justify-between p-3 bg-[#0f1217] border border-white/5 rounded-lg">
-                    <div className="flex items-center gap-3">
-                      <MonitorPlay className="w-4 h-4 text-[#f6c200]" />
-                      <span className="text-[#a0a7b3] text-sm">Nombre de sites</span>
-                    </div>
-                    <span className="text-white text-lg font-bold">{user.sites_limit ?? '—'}</span>
-                  </div>
-                  <div className="flex items-center justify-between p-3 bg-[#0f1217] border border-white/5 rounded-lg">
-                    <div className="flex items-center gap-3">
-                      <MonitorPlay className="w-4 h-4 text-[#f6c200]" />
-                      <span className="text-[#a0a7b3] text-sm">Nombre de posts</span>
-                    </div>
-                    <span className="text-white text-lg font-bold">{user.posts_limit ?? '—'}</span>
-                  </div>
-                  {activatedAt && (
-                    <div className="flex items-center justify-between p-3 bg-[#0f1217] border border-white/5 rounded-lg">
-                      <div className="flex items-center gap-3">
-                        <CalendarCheck className="w-4 h-4 text-[#f6c200]" />
-                        <span className="text-[#a0a7b3] text-sm">Activé le</span>
-                      </div>
-                      <span className="text-white text-sm">{activatedAt}</span>
-                    </div>
-                  )}
                 </div>
                 <p className="text-[#a0a7b3] text-xs mt-4">
-                  Le numéro client (nombre de clients) ne peut pas être modifié. Les limites sites et posts peuvent être ajustées ci-dessous via un nouveau code de sérialisation.
+                  Le numéro client ne peut pas être modifié.
                 </p>
-              </div>
-
-              <div className="bg-[#111418]/80 border border-white/10 rounded-lg p-5">
-                <div className="flex items-center gap-2 mb-1">
-                  <RefreshCw className="w-4 h-4 text-[#f6c200]" />
-                  <h3 className="text-[#f6c200] text-sm font-semibold uppercase tracking-wider">
-                    Modifier mes limites
-                  </h3>
-                </div>
-                <p className="text-[#a0a7b3] text-xs mb-4">
-                  Saisissez les nouvelles valeurs puis demandez à votre administrateur de générer un nouveau code de sérialisation
-                  (application mobile) avec ces valeurs. Confirmez ensuite le changement en saisissant ce code.
-                </p>
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-xs text-[#a0a7b3] mb-1">Nombre de sites</label>
-                    <input type="number" min="0" value={limitSites} onChange={(e) => setLimitSites(e.target.value)}
-                      className="w-full px-3 py-2 bg-[#0f1217] border border-white/10 rounded-lg text-white text-sm focus:outline-none focus:border-[#f6c200]/50" />
-                  </div>
-                  <div>
-                    <label className="block text-xs text-[#a0a7b3] mb-1">Nombre de posts</label>
-                    <input type="number" min="0" value={limitPosts} onChange={(e) => setLimitPosts(e.target.value)}
-                      className="w-full px-3 py-2 bg-[#0f1217] border border-white/10 rounded-lg text-white text-sm focus:outline-none focus:border-[#f6c200]/50" />
-                  </div>
-                </div>
-                <div className="mt-3">
-                  <label className="block text-xs text-[#a0a7b3] mb-1">Nouveau code de sérialisation (vérification)</label>
-                  <input type="text" value={limitCode} onChange={(e) => setLimitCode(e.target.value.toUpperCase().replace(/[^A-Z0-9-]/g, ''))}
-                    placeholder="XXXXX-XXXXX-XXXXX-XXXXX"
-                    className="w-full px-3 py-2 bg-[#0f1217] border border-white/10 rounded-lg text-white text-sm font-mono tracking-wide focus:outline-none focus:border-[#f6c200]/50" />
-                </div>
-                <button onClick={handleUpdateLimits} disabled={updatingLimits}
-                  className="mt-4 flex items-center gap-2 px-4 py-2 text-sm text-[#f6c200] border border-[#f6c200]/30 rounded-lg hover:bg-[#f6c200]/10 transition-colors disabled:opacity-50">
-                  <KeySquare className="w-4 h-4" />
-                  {updatingLimits ? 'Confirmation...' : 'Confirmer la modification'}
-                </button>
               </div>
 
               <div className="bg-[#111418]/80 border border-white/10 rounded-lg p-5">

@@ -1,11 +1,11 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { LogOut, ChevronRight, ChevronDown, Building2, Monitor, ArrowLeft, Save, Eye, Search, Plus, Pencil, Trash2, RefreshCw, Users } from 'lucide-react';
 import ThemeToggle from '../components/ThemeToggle';
 import NavBar from '../components/NavBar';
 import { getSites, getPosts, getMedia, getGroups, getGroupPosts, applyConfigToGroup } from '../services/sites';
-import { getLayouts, getLayout } from '../services/layouts';
+import { getLayoutsWithZones, invalidateLayoutsCache, updateLayout } from '../services/layouts';
 import { getPostConfig, updatePostConfig, createSchedule, updateSchedule, deleteSchedule } from '../services/display';
 import { startSync } from '../services/sync';
 import ScheduleModal from '../components/ScheduleModal';
@@ -27,11 +27,11 @@ export default function DisplayConfig() {
   const { logout, user, canAccessZone } = useAuth();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
+  const initInFlight = useRef(false);
 
   const [sites, setSites] = useState([]);
   const [posts, setPosts] = useState([]);
   const [mediaList, setMediaList] = useState([]);
-  const [layouts, setLayouts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [notification, setNotification] = useState(null);
 
@@ -47,6 +47,9 @@ export default function DisplayConfig() {
   const [config, setConfig] = useState(null);
   const [configLoading, setConfigLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [rebootEditing, setRebootEditing] = useState(false);
+  const [rebootOnceEditing, setRebootOnceEditing] = useState(false);
+  const [rebootOnceValue, setRebootOnceValue] = useState('');
   const [layoutsDetail, setLayoutsDetail] = useState([]);
 
   const [scheduleModal, setScheduleModal] = useState(null);
@@ -54,43 +57,61 @@ export default function DisplayConfig() {
   const [showSyncModal, setShowSyncModal] = useState(false);
 
   const init = useCallback(async () => {
+    // Un seul chargement à la fois : cette fonction est relancée à chaque
+    // focus / onglet redeployé, et empiler les appels saturait le navigateur
+    // (net::ERR_INSUFFICIENT_RESOURCES sur les 1300 découpes).
+    if (initInFlight.current) return;
+    initInFlight.current = true;
     setLoading(true);
-    const [sitesRes, postsRes, mediaRes, layoutsRes, groupsRes] = await Promise.all([
-      getSites(),
-      getPosts(),
-      getMedia(),
-      getLayouts(),
-      getGroups(),
-    ]);
-    if (sitesRes.ok && sitesRes.data) {
-      setSites(sitesRes.data);
-      const expanded = {};
-      sitesRes.data.forEach(s => { expanded[s.site_id] = true; });
-      setExpandedSites(expanded);
+    try {
+      const [sitesRes, postsRes, mediaRes, groupsRes] = await Promise.all([
+        getSites(),
+        getPosts(),
+        getMedia(),
+        getGroups(),
+      ]);
+      if (sitesRes.ok && sitesRes.data) {
+        setSites(sitesRes.data);
+        const expanded = {};
+        sitesRes.data.forEach(s => { expanded[s.site_id] = true; });
+        setExpandedSites(expanded);
+      }
+      if (postsRes.ok && postsRes.data) setPosts(postsRes.data);
+      if (mediaRes.ok && mediaRes.data) setMediaList(mediaRes.data);
+      if (groupsRes.ok && groupsRes.data) setGroups(groupsRes.data);
+
+      // Les modèles + leurs zones arrivent en UNE requête, servies depuis le
+      // cache du service (qui partage aussi la requête déjà en vol). Avant, ce
+      // composant déclenchait un GET /layouts puis un GET /layouts/{id} par
+      // modèle (plus de 700 requêtes, plusieurs minutes) : chacune pouvait
+      // recevoir un 401 si le token expirait au milieu de la rafale.
+      setLayoutsDetail(await getLayoutsWithZones());
+    } finally {
+      initInFlight.current = false;
+      setLoading(false);
     }
-    if (postsRes.ok && postsRes.data) setPosts(postsRes.data);
-    if (mediaRes.ok && mediaRes.data) setMediaList(mediaRes.data);
-    if (layoutsRes.ok && layoutsRes.data) {
-      setLayouts(layoutsRes.data);
-      const details = await Promise.all(
-        layoutsRes.data.map(l => getLayout(l.layout_id))
-      );
-      setLayoutsDetail(details.filter(r => r.ok && r.data).map(r => r.data));
-    }
-    if (groupsRes.ok && groupsRes.data) setGroups(groupsRes.data);
-    setLoading(false);
+  }, []);
+
+  // Recharge le cache « modèles + zones » après une modification : les
+  // vignettes affichées doivent refléter les zones qui viennent d'être
+  // enregistrées.
+  const reloadLayoutsDetail = useCallback(async () => {
+    invalidateLayoutsCache();
+    setLayoutsDetail(await getLayoutsWithZones());
   }, []);
 
   useEffect(() => { init(); }, [init]);
 
   useEffect(() => {
     function handleFocus() { init(); }
-    window.addEventListener('focus', handleFocus);
-    document.addEventListener('visibilitychange', () => {
+    function handleVisibility() {
       if (document.visibilityState === 'visible') init();
-    });
+    }
+    window.addEventListener('focus', handleFocus);
+    document.addEventListener('visibilitychange', handleVisibility);
     return () => {
       window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleVisibility);
     };
   }, [init]);
 
@@ -99,6 +120,11 @@ export default function DisplayConfig() {
     const result = await getPostConfig(postId);
     if (result.ok && result.data) {
       setConfig(result.data);
+      setRebootEditing(false);
+      // Le bloc ponctuel repart de l'état vide après un purge serveur
+      // (exécuté ou expiré) : on referme l'édition et on recharge le champ.
+      setRebootOnceEditing(false);
+      setRebootOnceValue('');
     }
     setConfigLoading(false);
   }, []);
@@ -264,17 +290,54 @@ export default function DisplayConfig() {
     });
   }
 
-  async function handleSave() {
-    if (!selectedPostId || !config) return;
+  function buildConfigPayload(cfg, overrides = {}) {
+    const layoutId = cfg.layout?.layout_id || null;
+    const payload = {
+      layout_id: layoutId,
+      loop_enabled: cfg.loop_enabled,
+      schedule_enabled: cfg.schedule_enabled,
+      display_enabled: cfg.display_enabled,
+      reboot_enabled: cfg.reboot_enabled ?? false,
+      reboot_time: cfg.reboot_time || null,
+      zones: cfg.zones
+        .filter(z => canAccessZone(z.zone_number))
+        .flatMap(z => {
+          const playlist = z.media_playlist || (z.media ? [z.media] : []);
+          if (playlist.length === 0) {
+            return [{ zone_number: z.zone_number, media_id: null }];
+          }
+          return playlist.map((m, idx) => ({
+            zone_number: z.zone_number,
+            media_id: m.media_id,
+            display_order: idx + 1,
+            duration_seconds: m.duration_seconds ?? null,
+          }));
+        }),
+    };
+    // reboot_once_at n'est envoyé QUE sur action explicite (programmer /
+    // annuler). Envoyé systématiquement, un one-shot déjà passé ferait
+    // échouer l'enregistrement du récurrent (le serveur refuse le passé).
+    if ('reboot_once_at' in overrides) {
+      payload.reboot_once_at = overrides.reboot_once_at ?? null;
+    }
+    return payload;
+  }
+
+  async function persistConfig(overrides = {}) {
+    if (!selectedPostId || !config) return false;
+    const cfg = { ...config, ...overrides };
+    if (cfg.reboot_enabled && !cfg.reboot_time) {
+      showNotif('error', 'Indiquez une heure pour le redémarrage automatique.');
+      return false;
+    }
     setSaving(true);
 
-    const layoutId = config.layout?.layout_id || null;
+    const layoutId = cfg.layout?.layout_id || null;
 
-    if (layoutId && config.layout?.zones) {
-      const { updateLayout } = await import('../services/layouts');
+    if (layoutId && cfg.layout?.zones) {
       await updateLayout(layoutId, {
         is_active: true,
-        zones: config.layout.zones
+        zones: cfg.layout.zones
           .filter(z => canAccessZone(z.zone_number))
           .map(z => ({
             zone_number: z.zone_number,
@@ -287,35 +350,73 @@ export default function DisplayConfig() {
       });
     }
 
-    const payload = {
-      layout_id: layoutId,
-      loop_enabled: config.loop_enabled,
-      schedule_enabled: config.schedule_enabled,
-      display_enabled: config.display_enabled,
-      zones: config.zones
-        .filter(z => canAccessZone(z.zone_number))
-        .flatMap(z => {
-        const playlist = z.media_playlist || (z.media ? [z.media] : []);
-        if (playlist.length === 0) {
-          return [{ zone_number: z.zone_number, media_id: null }];
-        }
-        return playlist.map((m, idx) => ({
-          zone_number: z.zone_number,
-          media_id: m.media_id,
-          display_order: idx + 1,
-          duration_seconds: m.duration_seconds ?? null,
-        }));
-      }),
-    };
+    const payload = buildConfigPayload(cfg, overrides);
 
     const result = await updatePostConfig(selectedPostId, payload);
     if (result.ok) {
       showNotif('success', 'Configuration enregistrée.');
       await loadConfig(selectedPostId);
-    } else {
-      showNotif('error', extractDetailMessage(result.data?.detail, 'Erreur lors de l\'enregistrement.'));
+      await reloadLayoutsDetail();
+      setSaving(false);
+      return true;
     }
+    showNotif('error', extractDetailMessage(result.data?.detail, 'Erreur lors de l\'enregistrement.'));
     setSaving(false);
+    return false;
+  }
+
+  async function handleSave() {
+    if (!selectedPostId || !config) return;
+    await persistConfig();
+  }
+
+  async function handleSaveReboot() {
+    const ok = await persistConfig();
+    if (ok) setRebootEditing(false);
+  }
+
+  async function handleDisableReboot() {
+    const ok = await persistConfig({ reboot_enabled: false });
+    if (ok) setRebootEditing(false);
+  }
+
+  // ── Redémarrage ponctuel ────────────────────────────────────────────────
+  // Valeur déjà programmée (instant ISO renvoyé par le backend) au format
+  // attendu par <input type="datetime-local"> : "YYYY-MM-DDTHH:MM" en heure
+  // locale du navigateur. Vide si aucun one-shot armé.
+  const rebootOnceScheduled = config?.reboot_once_at || null;
+  const rebootOnceLocal = useMemo(() => {
+    if (!rebootOnceScheduled) return '';
+    const d = new Date(rebootOnceScheduled);
+    if (Number.isNaN(d.getTime())) return '';
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }, [rebootOnceScheduled]);
+
+  function formatRebootOnce(iso) {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    return `${d.toLocaleDateString()} à ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+  }
+
+  async function handleSaveRebootOnce() {
+    if (!rebootOnceValue) {
+      showNotif('error', 'Indiquez une date et une heure de redémarrage ponctuel.');
+      return;
+    }
+    const ok = await persistConfig({ reboot_once_at: rebootOnceValue });
+    if (ok) {
+      setRebootOnceEditing(false);
+      setRebootOnceValue('');
+    }
+  }
+
+  async function handleCancelRebootOnce() {
+    const ok = await persistConfig({ reboot_once_at: null });
+    if (ok) {
+      setRebootOnceEditing(false);
+      setRebootOnceValue('');
+    }
   }
 
   async function handleSync() {
@@ -345,7 +446,6 @@ export default function DisplayConfig() {
 
     const layoutId = config.layout?.layout_id || null;
     if (layoutId && config.layout?.zones) {
-      const { updateLayout } = await import('../services/layouts');
       await updateLayout(layoutId, {
         is_active: true,
         zones: config.layout.zones
@@ -394,6 +494,7 @@ export default function DisplayConfig() {
           (failed_post_ids.length ? ` Échecs: ${failed_post_ids.length}` : '')
       );
       if (selectedPostId) await loadConfig(selectedPostId);
+      await reloadLayoutsDetail();
     } else {
       showNotif('error', extractDetailMessage(result.data?.detail, 'Erreur lors de l\'application au groupe.'));
     }
@@ -754,6 +855,130 @@ export default function DisplayConfig() {
                         </div>
                       )}
                     </div>
+
+                    {/* Reboot Settings */}
+                    {targetType === 'post' && (
+                    <>
+                    <div className="bg-[#111418]/80 border border-white/10 rounded-lg p-4">
+                      <label className="block text-[#a0a7b3] text-xs font-semibold uppercase mb-3">Redémarrage</label>
+
+                      {config.reboot_enabled && !rebootEditing ? (
+                        <div className="space-y-2">
+                          <p className="text-sm text-white">Redémarrage automatique : <span className="text-[#f6c200] font-semibold">Activé</span></p>
+                          <p className="text-sm text-white">Heure : <span className="text-[#f6c200] font-semibold">{config.reboot_time}</span></p>
+                          {config.next_reboot_at && (
+                            <p className="text-[10px] text-[#a0a7b3]">
+                              Prochain redémarrage prévu : {new Date(config.next_reboot_at).toLocaleString()}
+                            </p>
+                          )}
+                          <div className="flex gap-2 pt-1">
+                            <button onClick={() => setRebootEditing(true)}
+                              className="px-3 py-1.5 text-xs font-medium rounded-lg bg-[#1a1f24] border border-white/10 text-[#a0a7b3] hover:text-[#f6c200] hover:border-[#f6c200]/30 transition-colors">
+                              <Pencil className="w-3 h-3 inline mr-1" />Modifier
+                            </button>
+                            <button onClick={handleDisableReboot} disabled={saving}
+                              className="px-3 py-1.5 text-xs font-medium rounded-lg bg-[#1a1f24] border border-white/10 text-red-300 hover:border-red-400/40 transition-colors">
+                              Désactiver
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="space-y-3">
+                          <label className="flex items-center gap-3 cursor-pointer">
+                            <input type="checkbox" checked={config.reboot_enabled}
+                              onChange={e => updateConfigField('reboot_enabled', e.target.checked)}
+                              className="w-4 h-4 rounded accent-[#f6c200] cursor-pointer" style={{ accentColor: '#f6c200' }} />
+                            <span className="text-sm text-white">Redémarrage automatique</span>
+                          </label>
+                          <div className="flex items-center gap-3">
+                            <label htmlFor="reboot-time" className="text-xs text-[#a0a7b3]">Heure</label>
+                            <input id="reboot-time" type="time" value={config.reboot_time || ''}
+                              onChange={e => updateConfigField('reboot_time', e.target.value || null)}
+                              className="bg-[#1a1f24] border border-white/10 rounded px-2 py-1.5 text-xs text-white focus:border-[#f6c200] focus:outline-none" />
+                          </div>
+                          <div className="flex gap-2 pt-1">
+                            <button onClick={handleSaveReboot} disabled={saving}
+                              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg disabled:opacity-50"
+                              style={{ background: 'linear-gradient(135deg, #f6c200, #ffdb4d)' }}>
+                              <Save className="w-3.5 h-3.5 text-[#111418]" />
+                              <span className="text-[#111418]">{saving ? 'Enregistrement...' : 'Enregistrer'}</span>
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
+                      <p className="mt-3 pt-3 border-t border-white/5 text-[10px] text-[#a0a7b3]">
+                        Le changement sera pris en compte à la prochaine synchronisation de la box (bouton Synchroniser ou synchro automatique quotidienne).
+                      </p>
+                    </div>
+
+                    {/* Redémarrage ponctuel —Bloc autonome, indépendant du
+                        récurrent ci-dessus : une seule date/heure, consommée puis
+                        purgée par le backend (migration 022, reboot_once_at).*/}
+                    <div className="bg-[#111418]/80 border border-white/10 rounded-lg p-4">
+                      <label className="block text-[#a0a7b3] text-xs font-semibold uppercase mb-3">Redémarrage ponctuel</label>
+
+                      {rebootOnceScheduled && !rebootOnceEditing ? (
+                        <div className="space-y-2">
+                          <p className="text-sm text-white">
+                            Redémarrage ponctuel programmé :{' '}
+                            <span className="text-[#f6c200] font-semibold">
+                              {formatRebootOnce(rebootOnceScheduled)}
+                            </span>
+                          </p>
+                          <div className="flex gap-2 pt-1">
+                            <button onClick={() => {
+                              setRebootOnceValue(rebootOnceLocal);
+                              setRebootOnceEditing(true);
+                            }}
+                              className="px-3 py-1.5 text-xs font-medium rounded-lg bg-[#1a1f24] border border-white/10 text-[#a0a7b3] hover:text-[#f6c200] hover:border-[#f6c200]/30 transition-colors">
+                              <Pencil className="w-3 h-3 inline mr-1" />Modifier
+                            </button>
+                            <button onClick={handleCancelRebootOnce} disabled={saving}
+                              className="px-3 py-1.5 text-xs font-medium rounded-lg bg-[#1a1f24] border border-white/10 text-red-300 hover:border-red-400/40 transition-colors">
+                              Annuler
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="space-y-3">
+                          <div className="flex items-center gap-3">
+                            <label htmlFor="reboot-once" className="text-xs text-[#a0a7b3]">Date et heure</label>
+                            <input id="reboot-once" type="datetime-local"
+                              value={rebootOnceEditing ? rebootOnceValue : rebootOnceLocal}
+                              onChange={e => {
+                                setRebootOnceEditing(true);
+                                setRebootOnceValue(e.target.value);
+                              }}
+                              className="bg-[#1a1f24] border border-white/10 rounded px-2 py-1.5 text-xs text-white focus:border-[#f6c200] focus:outline-none" />
+                          </div>
+                          <p className="text-[10px] text-[#a0a7b3]">
+                            Le poste redémarre une seule fois à cette date, puis la programmation est effacée automatiquement.
+                            Une date déjà passée est refusée.
+                          </p>
+                          <div className="flex gap-2 pt-1">
+                            <button onClick={handleSaveRebootOnce} disabled={saving}
+                              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg disabled:opacity-50"
+                              style={{ background: 'linear-gradient(135deg, #f6c200, #ffdb4d)' }}>
+                              <Save className="w-3.5 h-3.5 text-[#111418]" />
+                              <span className="text-[#111418]">{saving ? 'Enregistrement...' : 'Enregistrer'}</span>
+                            </button>
+                            {rebootOnceScheduled && (
+                              <button onClick={handleCancelRebootOnce} disabled={saving}
+                                className="px-3 py-1.5 text-xs font-medium rounded-lg bg-[#1a1f24] border border-white/10 text-red-300 hover:border-red-400/40 transition-colors">
+                                Annuler
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      )}
+
+                      <p className="mt-3 pt-3 border-t border-white/5 text-[10px] text-[#a0a7b3]">
+                        Le changement sera pris en compte à la prochaine synchronisation de la box (bouton Synchroniser ou synchro automatique quotidienne).
+                      </p>
+                    </div>
+                    </>
+                    )}
 
                     {/* Zone Parameters & Media Assignment */}
                     {currentZones.length > 0 && (

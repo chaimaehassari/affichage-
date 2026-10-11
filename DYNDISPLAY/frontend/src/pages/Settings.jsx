@@ -4,18 +4,18 @@ import { useAuth } from '../contexts/AuthContext';
 import { LogOut, Save, Plus, Pencil, Trash2, Wifi, Folder, Key, Shield, Settings as SettingsIcon } from 'lucide-react';
 import ThemeToggle from '../components/ThemeToggle';
 import NavBar from '../components/NavBar';
-import { getSettings, updateSettings, getFtpProfiles, createFtpProfile, updateFtpProfile, deleteFtpProfile, changePassword, updateLicenses, getAccountDevices, revokeDeviceAccount } from '../services/settings';
-import { getClients, updateClientLicense } from '../services/admins';
+import { getSettings, updateSettings, getFtpProfiles, createFtpProfile, updateFtpProfile, deleteFtpProfile, changePassword } from '../services/settings';
+import { getClients } from '../services/admins';
 import { extractDetailMessage } from '../services/api';
+import { validatePassword } from '../utils/passwordRules';
+import PasswordRulesHint from '../components/PasswordRulesHint';
 import SettingsAccessModal from '../components/SettingsAccessModal';
 import FtpProfileModal from '../components/FtpProfileModal';
 import TestFtpModal from '../components/TestFtpModal';
-import LicenseModal from '../components/LicenseModal';
-import ClientLicenseModal from '../components/ClientLicenseModal';
 import ClientSettings from './ClientSettings';
 
 export default function Settings() {
-  const { logout, user } = useAuth();
+  const { logout, user, isSuperAdmin } = useAuth();
   const navigate = useNavigate();
   const [authenticated, setAuthenticated] = useState(false);
   const [showAccessModal, setShowAccessModal] = useState(true);
@@ -25,7 +25,6 @@ export default function Settings() {
 
   const [settings, setSettings] = useState(null);
   const [ftpProfiles, setFtpProfiles] = useState([]);
-  const [devices, setDevices] = useState(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [notification, setNotification] = useState(null);
@@ -33,9 +32,7 @@ export default function Settings() {
   const [showFtpModal, setShowFtpModal] = useState(false);
   const [editingFtp, setEditingFtp] = useState(null);
   const [testingFtp, setTestingFtp] = useState(null);
-  const [showLicenseModal, setShowLicenseModal] = useState(false);
   const [clients, setClients] = useState([]);
-  const [licenseClient, setLicenseClient] = useState(null);
 
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -46,13 +43,18 @@ export default function Settings() {
   async function loadData() {
     setLoading(true);
     try {
-      const [settingsRes, profilesRes, clientsRes] = await Promise.all([getSettings(), getFtpProfiles(), getClients()]);
-      if (settingsRes.ok) setSettings(settingsRes.data);
-      if (profilesRes.ok) setFtpProfiles(profilesRes.data);
-      if (clientsRes.ok) setClients(clientsRes.data?.clients || []);
-      if (user?.is_superadmin) {
-        const devicesRes = await getAccountDevices();
-        if (devicesRes.ok) setDevices(devicesRes.data);
+      // Les réglages globaux, profils FTP et licences sont réservés au
+      // Super Admin (garde-fou API : require_superadmin). Un Admin
+      // classique ne charge que la liste de SES clients, déjà filtrée
+      // côté serveur.
+      if (isSuperAdmin) {
+        const [settingsRes, profilesRes, clientsRes] = await Promise.all([getSettings(), getFtpProfiles(), getClients()]);
+        if (settingsRes.ok) setSettings(settingsRes.data);
+        if (profilesRes.ok) setFtpProfiles(profilesRes.data);
+        if (clientsRes.ok) setClients(clientsRes.data?.clients || []);
+      } else {
+        const clientsRes = await getClients();
+        if (clientsRes.ok) setClients(clientsRes.data?.clients || []);
       }
     } catch (e) {
       console.error(e);
@@ -137,31 +139,6 @@ export default function Settings() {
     }
   }
 
-  async function handleRevokeDevice(userId) {
-    const result = await revokeDeviceAccount(userId);
-    if (result.ok) {
-      setNotification({ type: 'success', text: 'Appareil libéré. Le prochain appareil sera autorisé automatiquement.' });
-      const devicesRes = await getAccountDevices();
-      if (devicesRes.ok) setDevices(devicesRes.data);
-    } else {
-      const detail = result.data?.detail;
-      setNotification({ type: 'error', text: typeof detail === 'string' && detail ? detail : 'Impossible de libérer cet appareil.' });
-    }
-    setTimeout(() => setNotification(null), 4000);
-  }
-
-  async function handleClientLicenseSave(client, sites, posts) {
-    const res = await updateClientLicense(client.client_code, sites, posts);
-    if (!res.ok) {
-      const detail = res.data?.detail;
-      throw new Error(typeof detail === 'string' && detail ? detail : 'Impossible de mettre à jour la licence.');
-    }
-    setClients(prev => prev.map(c => c.client_code === client.client_code ? { ...c, license_sites: sites, license_posts: posts } : c));
-    setLicenseClient(null);
-    setNotification({ type: 'success', text: 'Licences mises à jour.' });
-    setTimeout(() => setNotification(null), 3000);
-  }
-
   function updateField(field, value) {
     setSettings(prev => ({ ...prev, [field]: value }));
   }
@@ -175,6 +152,16 @@ export default function Settings() {
     if (newPassword !== confirmPassword) {
       setNotification({ type: 'error', text: 'Les mots de passe ne correspondent pas.' });
       setTimeout(() => setNotification(null), 3000);
+      return;
+    }
+    // Politique de mot de passe vérifiée AVANT l'appel. Sans ce contrôle,
+    // un mot de passe hors règles partait en 422 : la notification affichait
+    // « Value error, new_password ... » et l'utilisateur n'avait aucun moyen
+    // de savoir ce qu'il fallait corriger.
+    const invalid = validatePassword(newPassword, 'Le nouveau mot de passe est obligatoire.');
+    if (invalid) {
+      setNotification({ type: 'error', text: invalid });
+      setTimeout(() => setNotification(null), 4000);
       return;
     }
     setChangingPassword(true);
@@ -197,6 +184,92 @@ export default function Settings() {
 
   if (user?.profile_name !== 'Administrateur') {
     return <ClientSettings />;
+  }
+
+  // --- Admin classique ---------------------------------------------------
+  // Vue volontairement réduite : mot de passe + codes. Tout le reste
+  // (réglages globaux, licences clients, FTP, mot de passe d'accès)
+  // reste réservé au Super Admin, et l'API le refuse également.
+  if (!isSuperAdmin) {
+    return (
+      <div className="min-h-screen bg-[#0b0d10] relative overflow-hidden">
+        <div className="absolute inset-0">
+          <div className="absolute inset-0 bg-gradient-to-br from-[#0b0d10] via-[#0f1217] to-[#0b0d10]" />
+          <div className="absolute inset-0 opacity-80 bg-[radial-gradient(ellipse_at_center,transparent_30%,#0b0d10_100%)]" />
+        </div>
+
+        {notification && (
+          <div className={`fixed top-4 right-4 z-50 px-4 py-2.5 rounded text-sm border ${notification.type === 'success' ? 'bg-green-950/80 border-green-700/50 text-green-300' : 'bg-red-950/80 border-red-700/50 text-red-300'}`}>
+            {notification.text}
+          </div>
+        )}
+
+        <NavBar user={user} onLogout={logout} title="Paramètres" />
+
+        <div className="relative z-10 max-w-2xl mx-auto px-6 py-10 space-y-6">
+          <Section title="Mot de passe">
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs text-[#a0a7b3] mb-1">Mot de passe actuel</label>
+                <input type="password" value={currentPassword} onChange={e => setCurrentPassword(e.target.value)}
+                  className="w-full px-3 py-2 bg-[#0f1217] border border-white/10 rounded-lg text-white text-sm focus:outline-none focus:border-[#f6c200]/50" />
+              </div>
+              <div>
+                <label className="block text-xs text-[#a0a7b3] mb-1">Nouveau mot de passe</label>
+                <input type="password" value={newPassword} onChange={e => setNewPassword(e.target.value)}
+                  className="w-full px-3 py-2 bg-[#0f1217] border border-white/10 rounded-lg text-white text-sm focus:outline-none focus:border-[#f6c200]/50" />
+                <PasswordRulesHint value={newPassword} />
+              </div>
+              <div>
+                <label className="block text-xs text-[#a0a7b3] mb-1">Confirmer le mot de passe</label>
+                <input type="password" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)}
+                  className="w-full px-3 py-2 bg-[#0f1217] border border-white/10 rounded-lg text-white text-sm focus:outline-none focus:border-[#f6c200]/50" />
+              </div>
+              <button onClick={handleChangePassword} disabled={changingPassword}
+                className="flex items-center gap-2 px-4 py-2 text-sm text-[#f6c200] border border-[#f6c200]/30 rounded-lg hover:bg-[#f6c200]/10 transition-colors disabled:opacity-50">
+                <Key className="w-4 h-4" />
+                {changingPassword ? 'Modification...' : 'Changer le mot de passe'}
+              </button>
+            </div>
+          </Section>
+
+          <Section title="Mon code">
+            <div className="space-y-4">
+              <div>
+                <label className="block text-xs text-[#a0a7b3] mb-1">Votre code administrateur</label>
+                <div className="px-3 py-2 bg-[#0f1217] border border-white/10 rounded-lg text-white text-sm font-mono">
+                  {user?.user_code || '—'}
+                </div>
+                <p className="text-xs text-[#a0a7b3] mt-1">
+                  Identifiant de votre compte administrateur. Sa modification est réservée au Super Admin.
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-xs text-[#a0a7b3] mb-2">Codes clients qui vous sont affectés</label>
+                {loading ? (
+                  <p className="text-sm text-[#a0a7b3]">Chargement...</p>
+                ) : clients.length === 0 ? (
+                  <p className="text-sm text-[#a0a7b3]">Aucun client ne vous est affecté pour le moment.</p>
+                ) : (
+                  <div className="flex flex-wrap gap-2">
+                    {clients.map(c => (
+                      <span key={c.client_code}
+                        className="px-3 py-1.5 bg-[#0f1217] border border-white/10 rounded-lg text-white text-sm font-mono">
+                        {c.client_code}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                <p className="text-xs text-[#a0a7b3] mt-2">
+                  La création et la rotation des codes clients sont réservées au Super Admin.
+                </p>
+              </div>
+            </div>
+          </Section>
+        </div>
+      </div>
+    );
   }
 
   if (showAccessModal) {
@@ -222,38 +295,6 @@ export default function Settings() {
       {testingFtp && (
         <TestFtpModal profileId={testingFtp.profile_id} profileName={testingFtp.name} onClose={() => setTestingFtp(null)} />
       )}
-      {showLicenseModal && (
-        <LicenseModal
-          currentSites={settings?.license_sites || 0}
-          currentPosts={settings?.license_posts || 0}
-          onUpdate={async (code, sites, posts) => {
-            const res = await updateLicenses(code, sites, posts);
-            if (!res.ok) {
-              const detail = res.data?.detail;
-              throw new Error(typeof detail === 'string' && detail ? detail : 'Code de licence invalide.');
-            }
-            setSettings(prev => ({
-              ...prev,
-              license_sites: sites,
-              license_posts: posts,
-              used_sites: res.data.used_sites ?? prev?.used_sites,
-              used_posts: res.data.used_posts ?? prev?.used_posts,
-            }));
-            setShowLicenseModal(false);
-            setNotification({ type: 'success', text: 'Licences mises à jour.' });
-            setTimeout(() => setNotification(null), 3000);
-          }}
-          onCancel={() => setShowLicenseModal(false)}
-        />
-      )}
-      {licenseClient && (
-        <ClientLicenseModal
-          client={licenseClient}
-          onSave={(sites, posts) => handleClientLicenseSave(licenseClient, sites, posts)}
-          onClose={() => setLicenseClient(null)}
-        />
-      )}
-
       <div className="relative z-10 flex flex-col min-h-screen">
         <header className="px-8 py-2 flex items-center justify-between border-b border-white/5 bg-[#111418]/60">
           <h1 onClick={() => navigate('/')} className="text-[#f6c200] text-3xl font-bold tracking-wider cursor-pointer">DynDisplay</h1>
@@ -290,30 +331,33 @@ export default function Settings() {
               </div>
             ) : settings && (
               <div className="space-y-6">
-                <Section title="Mot de passe">
-                  <div className="space-y-3">
-                    <div>
-                      <label className="block text-xs text-[#a0a7b3] mb-1">Mot de passe actuel</label>
-                      <input type="password" value={currentPassword} onChange={e => setCurrentPassword(e.target.value)}
-                        className="w-full px-3 py-2 bg-[#0f1217] border border-white/10 rounded-lg text-white text-sm focus:outline-none focus:border-[#f6c200]/50" />
+                {user?.is_superadmin && (
+                  <Section title="Mot de passe">
+                    <div className="space-y-3">
+                      <div>
+                        <label className="block text-xs text-[#a0a7b3] mb-1">Mot de passe actuel</label>
+                        <input type="password" value={currentPassword} onChange={e => setCurrentPassword(e.target.value)}
+                          className="w-full px-3 py-2 bg-[#0f1217] border border-white/10 rounded-lg text-white text-sm focus:outline-none focus:border-[#f6c200]/50" />
+                      </div>
+                      <div>
+                        <label className="block text-xs text-[#a0a7b3] mb-1">Nouveau mot de passe</label>
+                        <input type="password" value={newPassword} onChange={e => setNewPassword(e.target.value)}
+                          className="w-full px-3 py-2 bg-[#0f1217] border border-white/10 rounded-lg text-white text-sm focus:outline-none focus:border-[#f6c200]/50" />
+                        <PasswordRulesHint value={newPassword} />
+                      </div>
+                      <div>
+                        <label className="block text-xs text-[#a0a7b3] mb-1">Confirmer le mot de passe</label>
+                        <input type="password" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)}
+                          className="w-full px-3 py-2 bg-[#0f1217] border border-white/10 rounded-lg text-white text-sm focus:outline-none focus:border-[#f6c200]/50" />
+                      </div>
+                      <button onClick={handleChangePassword} disabled={changingPassword}
+                        className="flex items-center gap-2 px-4 py-2 text-sm text-[#f6c200] border border-[#f6c200]/30 rounded-lg hover:bg-[#f6c200]/10 transition-colors disabled:opacity-50">
+                        <Key className="w-4 h-4" />
+                        {changingPassword ? 'Modification...' : 'Changer le mot de passe'}
+                      </button>
                     </div>
-                    <div>
-                      <label className="block text-xs text-[#a0a7b3] mb-1">Nouveau mot de passe</label>
-                      <input type="password" value={newPassword} onChange={e => setNewPassword(e.target.value)}
-                        className="w-full px-3 py-2 bg-[#0f1217] border border-white/10 rounded-lg text-white text-sm focus:outline-none focus:border-[#f6c200]/50" />
-                    </div>
-                    <div>
-                      <label className="block text-xs text-[#a0a7b3] mb-1">Confirmer le mot de passe</label>
-                      <input type="password" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)}
-                        className="w-full px-3 py-2 bg-[#0f1217] border border-white/10 rounded-lg text-white text-sm focus:outline-none focus:border-[#f6c200]/50" />
-                    </div>
-                    <button onClick={handleChangePassword} disabled={changingPassword}
-                      className="flex items-center gap-2 px-4 py-2 text-sm text-[#f6c200] border border-[#f6c200]/30 rounded-lg hover:bg-[#f6c200]/10 transition-colors disabled:opacity-50">
-                      <Key className="w-4 h-4" />
-                      {changingPassword ? 'Modification...' : 'Changer le mot de passe'}
-                    </button>
-                  </div>
-                </Section>
+                  </Section>
+                )}
 
                 <Section title="Licences">
                   <div className="grid grid-cols-3 gap-4 mb-4">
@@ -338,141 +382,10 @@ export default function Settings() {
                     <div className="bg-[#0f1217] border border-white/5 rounded-lg p-4">
                       <p className="text-xs text-[#a0a7b3] mb-1">Code client</p>
                       <p className="text-white font-mono text-lg truncate">{settings.code_client || '—'}</p>
-                      <button
-                        onClick={() => setShowLicenseModal(true)}
-                        className="mt-1 text-xs text-[#f6c200] hover:text-[#ffdb4d] transition-colors flex items-center gap-1"
-                      >
-                        <Key className="w-3.5 h-3.5" /> Modifier les licences
-                      </button>
                     </div>
                   </div>
 
-                  {user?.is_superadmin && devices && (
-                    <div className="mt-5">
-                      <h4 className="text-xs text-[#a0a7b3] mb-3 uppercase tracking-wider">Comptes & appareils</h4>
-                      <div className="overflow-x-auto rounded-lg border border-white/5">
-                        <table className="w-full text-sm">
-                          <thead>
-                            <tr className="bg-[#0f1217] text-left text-xs text-[#a0a7b3]">
-                              <th className="px-3 py-2.5 font-medium">Compte</th>
-                              <th className="px-3 py-2.5 font-medium">Profil</th>
-                              <th className="px-3 py-2.5 font-medium">Code client</th>
-                              <th className="px-3 py-2.5 font-medium">Appareil</th>
-                              <th className="px-3 py-2.5 font-medium">Activé le</th>
-                              <th className="px-3 py-2.5 font-medium text-right">Action</th>
-                            </tr>
-                          </thead>
-                          <tbody className="divide-y divide-white/5">
-                            {devices.accounts.length === 0 && (
-                              <tr>
-                                <td colSpan="6" className="px-3 py-4 text-center text-[#a0a7b3] text-xs">
-                                  Aucun compte actif.
-                                </td>
-                              </tr>
-                            )}
-                            {devices.accounts.map(a => (
-                              <tr key={a.user_id} className="hover:bg-white/[0.02]">
-                                <td className="px-3 py-2.5 text-white">{a.login}</td>
-                                <td className="px-3 py-2.5 text-[#a0a7b3]">{a.profile_name || '—'}</td>
-                                <td className="px-3 py-2.5 text-[#a0a7b3] font-mono text-xs">{a.user_code || '—'}</td>
-                                <td className="px-3 py-2.5 text-[#a0a7b3] font-mono text-xs">
-                                  {a.requires_activation
-                                    ? <span className="text-[#f6c200]">En attente d'activation</span>
-                                    : a.authorized_device_id || '—'}
-                                </td>
-                                <td className="px-3 py-2.5 text-[#a0a7b3] text-xs">
-                                  {a.activated_at ? a.activated_at.slice(0, 10) : '—'}
-                                </td>
-                                <td className="px-3 py-2.5 text-right">
-                                  {a.authorized_device_id ? (
-                                    <button
-                                      onClick={() => handleRevokeDevice(a.user_id)}
-                                      className="text-xs text-[#f6c200] hover:text-[#ffdb4d] border border-[#f6c200]/30 rounded px-2 py-1 transition-colors"
-                                    >
-                                      Libérer l'appareil
-                                    </button>
-                                  ) : (
-                                    <span className="text-[#a0a7b3] text-xs">—</span>
-                                  )}
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    </div>
-                  )}
-                </Section>
-
-                <Section title="Clients (multi-tenant)">
-                  <div className="overflow-x-auto rounded-lg border border-white/5">
-                    <table className="w-full text-sm">
-                      <thead>
-                        <tr className="bg-[#0f1217] text-left text-xs text-[#a0a7b3]">
-                          <th className="px-3 py-2.5 font-medium">Code client</th>
-                          <th className="px-3 py-2.5 font-medium">Nom</th>
-                          <th className="px-3 py-2.5 font-medium">Admins</th>
-                          <th className="px-3 py-2.5 font-medium">Sites</th>
-                          <th className="px-3 py-2.5 font-medium">Postes/Comptes</th>
-                          <th className="px-3 py-2.5 font-medium">Statut</th>
-                          {user?.is_superadmin && <th className="px-3 py-2.5 font-medium text-right">Action</th>}
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-white/5">
-                        {clients.length === 0 ? (
-                          <tr>
-                            <td colSpan={user?.is_superadmin ? 7 : 6} className="px-3 py-4 text-center text-[#a0a7b3] text-xs">
-                              Aucun client.
-                            </td>
-                          </tr>
-                        ) : (
-                          clients.map(c => {
-                            const posts = c.license_posts;
-                            const full = posts > 0 && c.user_count >= posts;
-                            return (
-                              <tr key={c.client_code} className="hover:bg-white/[0.02]">
-                                <td className="px-3 py-2.5 text-white font-mono text-xs">{c.client_code}</td>
-                                <td className="px-3 py-2.5 text-[#a0a7b3]">{c.client_name || '—'}</td>
-                                <td className="px-3 py-2.5 text-[#a0a7b3] text-xs">
-                                  {c.admin_login ? `${c.admin_login}${c.admin_code ? ` (${c.admin_code})` : ''}` : '—'}
-                                </td>
-                                <td className="px-3 py-2.5 text-white text-xs">{c.site_count}/{c.license_sites}</td>
-                                <td className="px-3 py-2.5 text-white text-xs">{c.user_count}/{c.license_posts}</td>
-                                <td className="px-3 py-2.5">
-                                  {posts > 0 ? (
-                                    full ? (
-                                      <span className="inline-flex items-center text-xs font-medium px-2.5 py-1 rounded-full bg-red-500/15 text-red-300 border border-red-500/30">
-                                        Quota atteint
-                                      </span>
-                                    ) : (
-                                      <span className="inline-flex items-center text-xs font-medium px-2.5 py-1 rounded-full bg-emerald-500/15 text-white border border-emerald-500/20">
-                                        Disponible
-                                      </span>
-                                    )
-                                  ) : (
-                                    <span className="inline-flex items-center text-xs font-medium px-2.5 py-1 rounded-full bg-zinc-500/15 text-white border border-zinc-500/20">
-                                      Aucun poste
-                                    </span>
-                                  )}
-                                </td>
-                                {user?.is_superadmin && (
-                                  <td className="px-3 py-2.5 text-right">
-                                    <button
-                                      onClick={() => setLicenseClient(c)}
-                                      className="text-xs text-[#f6c200] hover:text-[#ffdb4d] border border-[#f6c200]/30 rounded px-2 py-1 transition-colors"
-                                    >
-                                      Appliquer licence
-                                    </button>
-                                  </td>
-                                )}
-                              </tr>
-                            );
-                          })
-                        )}
-                      </tbody>
-                    </table>
-                  </div>
-                </Section>
+                  </Section>
 
                 <Section title="Gestion des profils (FTP)">
                   <div className="space-y-3">

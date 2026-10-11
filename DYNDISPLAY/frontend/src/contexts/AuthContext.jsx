@@ -3,8 +3,6 @@ import {
   getMe,
   loginRequest,
   logoutRequest,
-  activateAccount,
-  activateAccountDevice,
 } from '../services/auth';
 import apiService, { subscribeUnauthorized } from '../services/api';
 
@@ -34,15 +32,22 @@ export function AuthProvider({ children }) {
     }
 
     try {
+      // getMe() bénéficie du renouvellement automatique : si le token
+      // d'accès a expiré pendant que l'onglet était fermé, apiService tente
+      // un refresh verrouillé puis rejoue l'appel. L'utilisateur n'est
+      // déconnecté que si ce refresh échoue lui aussi.
       const result = await getMe();
       if (result.ok && result.data) {
         setUser(result.data);
-      } else {
+      } else if (result.status === 401) {
+        // Échec définitif du refresh : la session est réellement terminée.
         apiService.clearToken();
         setUser(null);
       }
+      // Autre erreur (réseau, 5xx) : on ne détruit PAS la session, on
+      // recharge simplement. Effacer le token sur un timeout réseau
+      // déconnectait l'utilisateur pour une panne passagère.
     } catch {
-      apiService.clearToken();
       setUser(null);
     } finally {
       setLoading(false);
@@ -69,6 +74,10 @@ export function AuthProvider({ children }) {
 
       if (result.ok && result.data) {
         apiService.setToken(result.data.access_token);
+        // Le refresh token permet de renouveler un accès expiré sans
+        // ressaisir le mot de passe. S'il est absent (serveur non mis à jour),
+        // l'apiService fonctionnera comme avant.
+        apiService.setRefreshToken(result.data.refresh_token);
         setUser(result.data.user);
         setLoading(false);
         return { success: true };
@@ -77,41 +86,6 @@ export function AuthProvider({ children }) {
       const detail = result.data?.detail;
       const message = detail || 'Identifiant ou mot de passe incorrect.';
       setError(getErrorMessage(result.data));
-      setLoading(false);
-
-      const gateCode =
-        detail && typeof detail === 'object' && !Array.isArray(detail) ? detail.code : null;
-      if (gateCode === 'account_activation_required' || gateCode === 'device_change_activation_required') {
-        return {
-          success: false,
-          error: message,
-          needsActivation: true,
-          gateCode,
-          accountCode: detail.account_code || null,
-        };
-      }
-      return { success: false, error: message };
-    } catch {
-      const message = 'Erreur de connexion au serveur.';
-      setError(message);
-      setLoading(false);
-      return { success: false, error: message };
-    }
-  };
-
-  const activateDevice = async (loginStr, activationCode, password, clientCode) => {
-    setError(null);
-    setLoading(true);
-    try {
-      const result = await activateAccountDevice(loginStr, activationCode);
-      if (result.ok && result.data && result.data.success) {
-        setLoading(false);
-        return await login(loginStr, password, clientCode);
-      }
-      const detail = result.data?.detail;
-      const message =
-        typeof detail === 'string' && detail ? detail : "Code d'activation invalide ou expiré.";
-      setError(message);
       setLoading(false);
       return { success: false, error: message };
     } catch {
@@ -145,26 +119,9 @@ export function AuthProvider({ children }) {
     }
   };
 
-  const activate = async (code) => {
-    setError(null);
-    try {
-      const result = await activateAccount(code);
-      if (result.ok && result.data) {
-        setUser(result.data);
-        return { success: true };
-      }
-      const detail = result.data?.detail;
-      setError(typeof detail === 'string' && detail ? detail : 'Code de sérialisation invalide.');
-      return { success: false, error: detail };
-    } catch {
-      const message = 'Erreur de connexion au serveur.';
-      setError(message);
-      return { success: false, error: message };
-    }
-  };
-
-  const applySession = (token, userData) => {
+  const applySession = (token, userData, refreshToken) => {
     apiService.setToken(token);
+    if (refreshToken) apiService.setRefreshToken(refreshToken);
     setUser(userData);
     setError(null);
   };
@@ -177,13 +134,9 @@ export function AuthProvider({ children }) {
     logout,
     refreshUser,
     applySession,
-    activate,
-    activateDevice,
     isAuthenticated: !!user,
     isAdmin: user?.profile_name === 'Administrateur',
     isSuperAdmin: user?.profile_name === 'Administrateur' && !!user?.is_superadmin,
-    needsActivation: !!user && user.is_activated === false,
-    isActivated: !user || user.is_activated === true,
     hasPermission: (code) => {
       if (!user) return false;
       if (user.profile_name === 'Administrateur') return true;

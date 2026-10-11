@@ -10,6 +10,10 @@ export async function getClientDetail(code) {
   return apiService.get(`${PREFIX}/clients/${code}`);
 }
 
+export async function createClient(data) {
+  return apiService.post(`${PREFIX}/clients`, data);
+}
+
 export async function updateClientLicense(code, licenseSites, licensePosts) {
   return apiService.put(`${PREFIX}/clients/${code}/license`, {
     license_sites: licenseSites,

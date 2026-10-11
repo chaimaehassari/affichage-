@@ -5,6 +5,7 @@ import { LogOut, ArrowLeft, Plus, Pencil, Trash2, Eye, Search } from 'lucide-rea
 import ThemeToggle from '../components/ThemeToggle';
 import NavBar from '../components/NavBar';
 import { getSites, createSite, updateSite, deleteSite, getPosts, createPost, updatePost, deletePost } from '../services/sites';
+import { startSync } from '../services/sync';
 import { extractDetailMessage } from '../services/api';
 
 export default function SitesPosts() {
@@ -25,7 +26,7 @@ export default function SitesPosts() {
   const [editingPost, setEditingPost] = useState(null);
 
   const [siteForm, setSiteForm] = useState({ code: '', name: '', address: '', description: '', is_active: true });
-  const [postForm, setPostForm] = useState({ code: '', name: '', player_type: 'Windows', ip_address: '', is_active: true, site_id: '' });
+  const [postForm, setPostForm] = useState({ code: '', name: '', player_type: 'Windows', ip_address: '', is_active: true, site_id: '', reboot_enabled: false, reboot_time: '' });
   const [saving, setSaving] = useState(false);
 
   const [siteSearch, setSiteSearch] = useState('');
@@ -125,13 +126,13 @@ export default function SitesPosts() {
   // --- Post CRUD ---
   function openNewPost() {
     setEditingPost(null);
-    setPostForm({ code: '', name: '', player_type: 'Windows', ip_address: '', is_active: true, site_id: selectedSite?.site_id || '' });
+    setPostForm({ code: '', name: '', player_type: 'Windows', ip_address: '', is_active: true, site_id: selectedSite?.site_id || '', reboot_enabled: false, reboot_time: '' });
     setShowPostModal(true);
   }
 
   function openEditPost(post) {
     setEditingPost(post);
-    setPostForm({ code: post.code, name: post.name, player_type: post.player_type || 'Windows', ip_address: post.ip_address || '', is_active: post.is_active, site_id: post.site_id });
+    setPostForm({ code: post.code, name: post.name, player_type: post.player_type || 'Windows', ip_address: post.ip_address || '', is_active: post.is_active, site_id: post.site_id, reboot_enabled: !!post.reboot_enabled, reboot_time: post.reboot_time || '' });
     setShowPostModal(true);
   }
 
@@ -139,18 +140,44 @@ export default function SitesPosts() {
     e.preventDefault();
     setSaving(true);
     try {
-      const payload = { ...postForm, site_id: parseInt(postForm.site_id) };
+      // L'heure n'est envoyée que si elle est renseignée : le backend conserve
+      // alors l'heure déjà enregistrée quand on désactive, plutôt que de
+      // l'effacer.
+      const payload = {
+        ...postForm,
+        site_id: parseInt(postForm.site_id),
+        reboot_time: postForm.reboot_time || null,
+      };
       let result;
+      let savedPost;
       if (editingPost) {
         result = await updatePost(editingPost.post_id, payload);
+        savedPost = editingPost;
       } else {
         result = await createPost(payload);
+        // createPost renvoie le poste créé : on en a besoin pour le cibler.
+        savedPost = result.data;
       }
       if (result.ok) {
-        showNotif('success', editingPost ? 'Poste modifié.' : 'Poste créé.');
         setShowPostModal(false);
         await fetchPosts(selectedSite?.site_id);
         await fetchSites();
+        showNotif('success', editingPost ? 'Poste modifié.' : 'Poste créé.');
+
+        // L'heure de redémarrage vit dans la configuration envoyée à la box :
+        // sans synchronisation, la télé garde son ancienne planification.
+        const rebootChanged = editingPost
+          ? (editingPost.reboot_enabled !== payload.reboot_enabled
+            || (payload.reboot_time || null) !== (editingPost.reboot_time || null))
+          : true;
+        if (rebootChanged) {
+          const syncResult = await startSync(savedPost.post_id);
+          if (syncResult.ok) {
+            showNotif('success', 'Synchronisation lancée : la box va recevoir la nouvelle planification de redémarrage.');
+          } else {
+            showNotif('error', `Poste enregistré, mais la synchronisation a échoué : ${extractDetailMessage(syncResult.data?.detail, 'erreur inconnue')}`);
+          }
+        }
       } else {
         showNotif('error', extractDetailMessage(result.data?.detail, 'Erreur.'));
       }
@@ -303,6 +330,32 @@ export default function SitesPosts() {
                 </button>
                 <span className="text-sm text-white">{postForm.is_active ? 'Actif' : 'Inactif'}</span>
               </div>
+
+              {/* Redémarrage automatique : planification gérée par le backend
+                  puis transmise à la box par la synchronisation déclenchée à
+                  l'enregistrement. */}
+              <div className="rounded-lg border border-white/10 bg-[#0f1217] p-3 space-y-3">
+                <div className="flex items-center gap-3">
+                  <button type="button" onClick={() => setPostForm(p => ({ ...p, reboot_enabled: !p.reboot_enabled }))}
+                    className={`w-10 h-5 rounded-full transition-colors relative ${postForm.reboot_enabled ? 'bg-[#f6c200]' : 'bg-[#2a2f36]'}`}>
+                    <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${postForm.reboot_enabled ? 'left-5.5' : 'left-0.5'}`} />
+                  </button>
+                  <span className="text-sm text-white">Redémarrage automatique</span>
+                  <span className="text-xs text-[#a0a7b3]">tous les jours à l'heure choisie</span>
+                </div>
+                {postForm.reboot_enabled && (
+                  <div>
+                    <label className="block text-xs text-[#a0a7b3] mb-1">Heure de redémarrage <span className="text-red-400">*</span></label>
+                    <input type="time" value={postForm.reboot_time} required
+                      onChange={(e) => setPostForm(p => ({ ...p, reboot_time: e.target.value }))}
+                      className="w-full bg-[#111418] text-white px-3 py-2.5 rounded-lg border border-white/10 text-sm focus:outline-none focus:border-[#f6c200]/50" />
+                    <p className="text-[10px] text-[#a0a7b3] mt-1">
+                      Une synchronisation sera lancée après l'enregistrement pour appliquer la planification sur la box.
+                    </p>
+                  </div>
+                )}
+              </div>
+
               <div className="flex gap-3 justify-end pt-2">
                 <button type="button" onClick={() => setShowPostModal(false)} className="px-4 py-2 bg-[#2a2f36] text-white/80 text-sm rounded-lg hover:bg-[#3a3646] border border-white/5">Annuler</button>
                 <button type="submit" disabled={saving} className="px-4 py-2 text-sm font-semibold rounded-lg disabled:opacity-50" style={{ background: 'linear-gradient(135deg, #f6c200, #ffdb4d)' }}>

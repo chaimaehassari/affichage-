@@ -3,7 +3,6 @@ import { useAuth } from '../contexts/AuthContext';
 import LoadingSpinner from '../components/common/LoadingSpinner';
 import MustChangePassword from '../components/MustChangePassword';
 import SessionLock from '../components/SessionLock';
-import ActivationScreen from '../components/ActivationScreen';
 
 export default function ProtectedRoute({ children }) {
   const { isAuthenticated, loading, user } = useAuth();
@@ -18,10 +17,6 @@ export default function ProtectedRoute({ children }) {
 
   if (!isAuthenticated) {
     return <Navigate to="/login" replace />;
-  }
-
-  if (user?.is_activated === false) {
-    return <ActivationScreen />;
   }
 
   if (user?.must_change_password) {

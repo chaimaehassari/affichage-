@@ -104,6 +104,11 @@ export async function batchAssignMedia(payload) {
   return apiService.post(`${PREFIX}/posts/batch-assign-media`, payload);
 }
 
+// --- Batch Reboot Schedule ---
+export async function batchRebootSchedule(payload) {
+  return apiService.post(`${PREFIX}/posts/batch-reboot-schedule`, payload);
+}
+
 // --- Media ---
 export async function getMedia(mediaType) {
   const params = mediaType ? `?media_type=${mediaType}` : '';

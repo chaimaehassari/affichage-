@@ -11,11 +11,14 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        target: 'http://localhost:8010',
         changeOrigin: true,
       },
-      '/media': {
-        target: 'http://localhost:8000',
+      // Regex obligatoire ('^/media/') et non '/media' : la clé littérale
+      // attrapait aussi la route SPA « Médiathèque » (/media), qui était
+      // donc proxyfiee vers FastAPI au lieu de servir index.html -> 404.
+      '^/media/': {
+        target: 'http://localhost:8010',
         changeOrigin: true,
       },
     },

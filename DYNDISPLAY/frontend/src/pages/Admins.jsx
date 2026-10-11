@@ -48,7 +48,12 @@ export default function Admins() {
   async function handleAdminSave(payload, adminId) {
     const result = adminId ? await updateAdmin(adminId, payload) : await createAdmin(payload);
     if (result.ok) {
-      notify('success', adminId ? 'Admin mis à jour.' : 'Admin créé.');
+      const auto = result.data?.auto_assigned_client;
+      if (auto) {
+        notify('success', `Admin ${adminId ? 'mis à jour' : 'créé'}. Client ${auto} affecté automatiquement.`);
+      } else {
+        notify('success', adminId ? 'Admin mis à jour.' : 'Admin créé.');
+      }
       setShowForm(false);
       setEditingAdmin(null);
       await refreshAdmins();
@@ -218,7 +223,6 @@ export default function Admins() {
                   <tr className="border-b border-white/10">
                     <th className="text-left px-4 py-3 text-xs font-semibold text-[#a0a7b3] uppercase tracking-wider">Login</th>
                     <th className="text-left px-4 py-3 text-xs font-semibold text-[#a0a7b3] uppercase tracking-wider">Code</th>
-                    <th className="text-left px-4 py-3 text-xs font-semibold text-[#a0a7b3] uppercase tracking-wider">Email</th>
                     <th className="text-left px-4 py-3 text-xs font-semibold text-[#a0a7b3] uppercase tracking-wider">Statut</th>
                     <th className="text-left px-4 py-3 text-xs font-semibold text-[#a0a7b3] uppercase tracking-wider">Clients</th>
                     <th className="text-left px-4 py-3 text-xs font-semibold text-[#a0a7b3] uppercase tracking-wider">Créé le</th>
@@ -227,9 +231,9 @@ export default function Admins() {
                 </thead>
                 <tbody>
                   {loading ? (
-                    <tr><td colSpan={7} className="px-4 py-8 text-center text-[#a0a7b3] text-sm">Chargement...</td></tr>
+                    <tr><td colSpan={6} className="px-4 py-8 text-center text-[#a0a7b3] text-sm">Chargement...</td></tr>
                   ) : sortedAdmins.length === 0 ? (
-                    <tr><td colSpan={7} className="px-4 py-8 text-center text-[#a0a7b3] text-sm">Aucun admin trouvé.</td></tr>
+                    <tr><td colSpan={6} className="px-4 py-8 text-center text-[#a0a7b3] text-sm">Aucun admin trouvé.</td></tr>
                   ) : (
                     sortedAdmins.map(a => {
                       const codes = a.client_codes || [];
@@ -246,7 +250,6 @@ export default function Admins() {
                             </span>
                           </td>
                           <td className="px-4 py-3 text-sm text-[#a0a7b3] font-mono text-xs">{a.user_code || '—'}</td>
-                          <td className="px-4 py-3 text-sm text-[#a0a7b3]">{a.email || '—'}</td>
                           <td className="px-4 py-3">
                             {a.is_active ? (
                               <span className="inline-flex items-center text-xs font-medium px-2.5 py-1 rounded-full bg-emerald-500/15 text-white border border-emerald-500/20">

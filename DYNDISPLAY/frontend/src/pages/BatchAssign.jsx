@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import {
@@ -29,6 +29,9 @@ export default function BatchAssign() {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [showAddPicker, setShowAddPicker] = useState(false);
 
+  const [groupSearch, setGroupSearch] = useState('');
+  const [hideEmptyGroups, setHideEmptyGroups] = useState(false);
+
 
 
   const init = useCallback(async () => {
@@ -39,6 +42,16 @@ export default function BatchAssign() {
   }, []);
 
   useEffect(() => { init(); }, [init]);
+
+  // Filtres de la liste : recherche par nom + masquage des groupes sans poste.
+  const visibleGroups = useMemo(() => {
+    const q = groupSearch.trim().toLowerCase();
+    return groups.filter(g => {
+      if (hideEmptyGroups && (g.post_count ?? 0) === 0) return false;
+      if (q && !String(g.name || '').toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }, [groups, groupSearch, hideEmptyGroups]);
 
   useEffect(() => {
     if (selectedGroupId) loadComposition(selectedGroupId);
@@ -237,12 +250,27 @@ export default function BatchAssign() {
                     <Plus className="w-3.5 h-3.5" /> Créer
                   </button>
                 </div>
+                <div className="flex gap-2 mb-2">
+                  <input
+                    value={groupSearch}
+                    onChange={e => setGroupSearch(e.target.value)}
+                    placeholder="Rechercher un groupe..."
+                    className="flex-1 px-2.5 py-1.5 bg-[#0f1217] border border-white/10 rounded-md text-white text-xs focus:outline-none focus:border-[#f6c200]/50" />
+                  <button
+                    onClick={() => setHideEmptyGroups(v => !v)}
+                    title={hideEmptyGroups ? 'Afficher aussi les groupes vides' : 'Masquer les groupes sans poste'}
+                    className={`px-2 py-1.5 text-xs rounded-md border transition-colors ${hideEmptyGroups ? 'bg-[#f6c200]/15 text-[#f6c200] border-[#f6c200]/40' : 'bg-[#0f1217] text-[#a0a7b3] border-white/10 hover:text-white'}`}>
+                    {hideEmptyGroups ? 'Sans vides' : 'Tous'}
+                  </button>
+                </div>
                 <div className="bg-[#111418]/80 border border-white/10 rounded-lg overflow-hidden">
                   <div className="max-h-[50vh] overflow-y-auto">
-                    {groups.length === 0 ? (
-                      <p className="px-4 py-4 text-center text-[#a0a7b3] text-xs">Aucun groupe.</p>
+                    {visibleGroups.length === 0 ? (
+                      <p className="px-4 py-4 text-center text-[#a0a7b3] text-xs">
+                        {groups.length === 0 ? 'Aucun groupe.' : 'Aucun groupe ne correspond au filtre.'}
+                      </p>
                     ) : (
-                      groups.map(g => (
+                      visibleGroups.map(g => (
                         <button key={g.group_id} onClick={() => setSelectedGroupId(g.group_id)}
                           className={`w-full flex flex-col gap-1 px-4 py-2.5 border-b border-white/5 text-left transition-colors ${selectedGroupId === g.group_id ? 'bg-[#f6c200]/10 border-l-2 border-l-[#f6c200]' : 'hover:bg-white/[0.02]'}`}>
                           <span className="flex items-center gap-2 text-sm text-white">

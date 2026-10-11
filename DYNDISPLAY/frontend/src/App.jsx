@@ -13,10 +13,12 @@ import LayoutEditor from './pages/LayoutEditor'
 import DisplayConfig from './pages/DisplayConfig'
 import SyncPage from './pages/SyncPage'
 import Supervision from './pages/Supervision'
+import DiffusionReport from './pages/DiffusionReport'
 import Settings from './pages/Settings'
 import Admins from './pages/Admins'
 import ProtectedRoute from './routes/ProtectedRoute'
 import PermissionRoute from './routes/PermissionRoute'
+import SuperAdminRoute from './routes/SuperAdminRoute'
 import ConnectionBanner from './components/ConnectionBanner'
 
 export default function App() {
@@ -35,7 +37,7 @@ export default function App() {
               <Route path="/users" element={<PermissionRoute permission="user_list"><UserList /></PermissionRoute>} />
               <Route path="/users/new" element={<PermissionRoute permission="user_create"><UserForm /></PermissionRoute>} />
               <Route path="/users/:id/edit" element={<PermissionRoute permission="user_update"><UserForm /></PermissionRoute>} />
-              <Route path="/admins" element={<Admins />} />
+              <Route path="/admins" element={<SuperAdminRoute><Admins /></SuperAdminRoute>} />
               <Route path="/sites-posts" element={<PermissionRoute permission="list_sites_posts"><SitesPosts /></PermissionRoute>} />
               <Route path="/batch-assign" element={<PermissionRoute permission="list_sites_posts"><BatchAssign /></PermissionRoute>} />
               <Route path="/media" element={<PermissionRoute permission="menu_media"><MediaLibrary /></PermissionRoute>} />
@@ -46,6 +48,7 @@ export default function App() {
               <Route path="/display-config" element={<PermissionRoute permission="menu_config"><DisplayConfig /></PermissionRoute>} />
               <Route path="/sync" element={<PermissionRoute permission="menu_sync"><SyncPage /></PermissionRoute>} />
               <Route path="/supervision" element={<PermissionRoute permission="menu_config"><Supervision /></PermissionRoute>} />
+              <Route path="/diffusion-report" element={<PermissionRoute permission="menu_config"><DiffusionReport /></PermissionRoute>} />
               <Route path="/settings" element={<Settings />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
