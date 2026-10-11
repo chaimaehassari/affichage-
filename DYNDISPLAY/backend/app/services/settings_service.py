@@ -2,8 +2,6 @@ from psycopg import Connection
 import psycopg
 from datetime import datetime, timezone
 
-from app.core.license_utils import validate_license
-
 
 class SettingsService:
     def __init__(self, conn: Connection):
@@ -63,8 +61,6 @@ class SettingsService:
 
     def update_settings(self, data: dict) -> dict:
         mapping = {
-            "license_sites": ("license_sites", "Nombre de licences sites"),
-            "license_posts": ("license_posts", "Nombre de licences postes"),
             "code_client": ("code_client", "Code d'accès client"),
             "sync_auto_enabled": ("sync_auto_enabled", "Synchronisation automatique"),
             "sync_auto_mode": ("sync_auto_mode", "Mode de synchro auto"),
@@ -94,56 +90,13 @@ class SettingsService:
         stored = self._get("code_client")
         return stored is not None and code == stored
 
-    def update_licenses(self, code: str) -> dict:
-        """Valide un code de licence HMAC et met à jour les quotas.
-
-        Le code est un payload signé généré par l'app Android ou l'outil
-        Python de référence. La signature HMAC-SHA256 est vérifiée ; si
-        valide, les valeurs décodées (client_code, sites, posts) sont
-        utilisées pour mettre à jour les settings.
-        """
-        info = validate_license(code)
-        if info is None:
-            raise ValueError("Code de licence invalide ou signature HMAC incorrecte.")
-        sites = info.sites
-        posts = info.posts
-        used = self.count_used_licenses()
-        if sites < used["used_sites"]:
-            raise ValueError(
-                f"Impossible de réduire le nombre de sites à {sites} : "
-                f"{used['used_sites']} site(s) existent en base."
-            )
-        if posts < used["used_posts"]:
-            raise ValueError(
-                f"Impossible de réduire le nombre de postes à {posts} : "
-                f"{used['used_posts']} poste(s) existent en base."
-            )
-        self._set("license_sites", str(sites), "Nombre de licences sites")
-        self._set("license_posts", str(posts), "Nombre de licences postes")
-        return self.get_all_settings()
-
-    def get_access_password_hash(self) -> str | None:
-        return self._get("settings_access_hash")
-
-    def verify_access_password(self, password: str, username: str | None = None) -> bool:
-        """Vérifie le mot de passe d'accès aux Paramètres.
-
-        Si un mot de passe dédié a été défini (settings_access_hash via
-        set_access_password), il fait référence. Sinon, repli sur le code
-        admin suprême JJMMAAAA du jour (comportement historique).
-        La vérification argon2 est à temps constant (déjà utilisée pour les
-        mots de passe utilisateurs, cf. core/security.verify_password).
-        """
-        stored = self.get_access_password_hash()
-        if stored:
-            from app.core.security import verify_password
-            return verify_password(password, stored)
-        from app.core.security import verify_supreme_admin_code
-        return verify_supreme_admin_code(password, username)
-
-    def set_access_password(self, password: str) -> None:
-        from app.core.security import hash_password
-        self._set("settings_access_hash", hash_password(password), "Mot de passe d'accès aux paramètres")
+    def get_session_timeout_minutes(self) -> int:
+        """Durée d'inactivité (minutes) avant verrouillage de session."""
+        value = self._get("session_timeout_minutes")
+        try:
+            return max(0, int(value)) if value else 0
+        except (TypeError, ValueError):
+            return 0
 
     def count_used_licenses(self) -> dict:
         site_count = self.conn.execute(
@@ -153,87 +106,6 @@ class SettingsService:
             "SELECT COUNT(*) AS cnt FROM posts WHERE is_active = TRUE"
         ).fetchone()["cnt"]
         return {"used_sites": site_count, "used_posts": post_count}
-
-    # --- Activation par compte / appareils (migration 016) ---
-
-    def get_license_posts(self) -> int:
-        value = self._get("license_posts")
-        if value:
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                pass
-        return 200
-
-    def count_activated_accounts(self) -> int:
-        row = self.conn.execute(
-            """
-            SELECT COUNT(*) AS cnt
-            FROM users
-            WHERE requires_activation = FALSE AND COALESCE(is_superadmin, FALSE) = FALSE
-            """
-        ).fetchone()
-        return row["cnt"] or 0
-
-    def list_account_devices(self) -> list[dict]:
-        rows = self.conn.execute(
-            """
-            SELECT u.user_id, u.login, u.user_code, u.account_code,
-                   u.requires_activation, u.authorized_device_id,
-                   u.activated_at, u.created_at,
-                   COALESCE(p.name, '') AS profile_name
-            FROM users u
-            LEFT JOIN profiles p ON p.profile_id = u.profile_id
-            WHERE COALESCE(u.is_superadmin, FALSE) = FALSE
-            ORDER BY u.user_id
-            """
-        ).fetchall()
-        return [
-            {
-                "user_id": r["user_id"],
-                "login": r["login"],
-                "user_code": r["user_code"],
-                "profile_name": r["profile_name"],
-                "account_code": r["account_code"],
-                "requires_activation": bool(r["requires_activation"]),
-                "authorized_device_id": r["authorized_device_id"],
-                "activated_at": r["activated_at"].isoformat() if r["activated_at"] else None,
-                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-            }
-            for r in rows
-        ]
-
-    def revoke_device(self, user_id: int) -> dict | None:
-        """Libère l'appareil lié à un compte (appelé par le Super Admin).
-
-        Le slot de licence n'est ni libéré ni reconsommé : le compte reste
-        dans son état d'activation actuel. Le prochain appareil qui se
-        connectera avec ce compte sera simplement autorisé pour ce compte.
-        """
-        user = self.conn.execute(
-            "SELECT user_id, is_superadmin, requires_activation FROM users WHERE user_id = %s",
-            (user_id,),
-        ).fetchone()
-        if not user:
-            return None
-        if user["is_superadmin"]:
-            raise ValueError("L'admin suprême n'est pas lié à un appareil.")
-
-        self.conn.execute(
-            """
-            UPDATE users
-            SET authorized_device_id = NULL, updated_at = %s
-            WHERE user_id = %s
-            """,
-            (datetime.now(timezone.utc), user_id),
-        )
-        self.conn.commit()
-        return {
-            "user_id": user_id,
-            "activated": not user["requires_activation"],
-            "requires_activation": bool(user["requires_activation"]),
-            "authorized_device_id": None,
-        }
 
 
 class FtpProfileService:

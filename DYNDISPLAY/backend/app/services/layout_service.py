@@ -27,6 +27,53 @@ class LayoutService:
             (layout_id,),
         ).fetchone()
 
+    def list_layouts_with_zones(self) -> list[dict]:
+        """Liste tous les layouts AVEC leurs zones, en 2 requêtes au total.
+
+        Remplace N appels à get_layout_detail (donc 2N requêtes) par une
+        seule lecture groupée. L'écran de configuration affiche les zones de
+        tous les modèles en vignettes, d'où l'intérêt d'un lot unique.
+        """
+        layouts = self.list_layouts()
+        if not layouts:
+            return []
+
+        rows = self.conn.execute(
+            """
+            SELECT layout_id, layout_zone_id, zone_number, position_x, position_y,
+                   width, height, is_active
+            FROM layout_zones
+            ORDER BY layout_id, zone_number
+            """
+        ).fetchall()
+
+        zones_by_layout: dict[int, list[dict]] = {}
+        for z in rows:
+            zones_by_layout.setdefault(z["layout_id"], []).append(
+                {
+                    "layout_zone_id": z["layout_zone_id"],
+                    "zone_number": z["zone_number"],
+                    "position_x": float(z["position_x"]),
+                    "position_y": float(z["position_y"]),
+                    "width": float(z["width"]),
+                    "height": float(z["height"]),
+                    "is_active": z["is_active"],
+                }
+            )
+
+        return [
+            {
+                "layout_id": layout["layout_id"],
+                "name": layout["name"],
+                "is_active": layout["is_active"],
+                "active_zone_count": layout["active_zone_count"] or 0,
+                "zones": zones_by_layout.get(layout["layout_id"], []),
+                "created_at": layout["created_at"].isoformat() if layout["created_at"] else None,
+                "updated_at": layout["updated_at"].isoformat() if layout["updated_at"] else None,
+            }
+            for layout in layouts
+        ]
+
     def get_layout_detail(self, layout_id: int) -> dict | None:
         layout = self.get_layout(layout_id)
         if not layout:

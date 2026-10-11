@@ -4,7 +4,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from fastapi import HTTPException
 
-from app.core.config import get_settings
+from app.core.config import build_postgres_dsn, get_settings
 
 settings = get_settings()
 
@@ -18,10 +18,7 @@ def _normalize_url(url: str) -> str:
 def _build_url() -> str:
     if settings.DATABASE_URL:
         return _normalize_url(settings.DATABASE_URL)
-    return (
-        f"postgresql://{settings.POSTGRES_USER}:{settings.POSTGRES_PASSWORD}"
-        f"@{settings.POSTGRES_HOST}:{settings.POSTGRES_PORT}/{settings.POSTGRES_DB}"
-    )
+    return build_postgres_dsn(settings)
 
 
 def connect_new() -> Connection:

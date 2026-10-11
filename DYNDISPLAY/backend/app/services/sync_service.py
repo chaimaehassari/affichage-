@@ -306,6 +306,16 @@ class SyncService:
 
         loop_enabled = config["loop_enabled"] if config else True
 
+        from app.services.reboot_schedule_service import (
+            refresh_next_reboot_at,
+            refresh_reboot_once_at,
+        )
+
+        reboot = refresh_next_reboot_at(self.conn, post_id)
+        # Ponctuel : purgé si l'échéance est dépassée, sinon transmis tel quel au
+        # player (qui compare l'instant à son horloge système).
+        once = refresh_reboot_once_at(self.conn, post_id)
+
         return {
             "post_id": post["post_id"],
             "code": post["code"],
@@ -315,6 +325,10 @@ class SyncService:
             "loop_enabled": loop_enabled,
             "schedule_enabled": config["schedule_enabled"] if config else False,
             "display_enabled": config["display_enabled"] if config else True,
+            "reboot_enabled": reboot["reboot_enabled"],
+            "reboot_time": reboot["reboot_time"],
+            "next_reboot_at": reboot["next_reboot_at"],
+            "reboot_once_at": once["reboot_once_at"],
             "schedules": [
                 {
                     "name": s["name"],
@@ -435,6 +449,9 @@ class SyncService:
             logger.info(f"Connecting to SFTP at {settings.SFTP_HOST}:{settings.SFTP_PORT}")
             with SFTPClient() as sftp:
                 logger.info("SFTP connected")
+                # Le player attend un dossier media même quand aucun média n'est
+                # à synchroniser : on garantit son existence à chaque sync.
+                sftp._ensure_remote_dir(media_dir)
 
                 all_files = []
                 for zone in config_data.get("zones", []):

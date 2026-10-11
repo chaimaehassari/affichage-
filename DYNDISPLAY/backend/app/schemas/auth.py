@@ -35,37 +35,7 @@ class UserInfo(BaseModel):
     zones: list[int] = []
     groups: list[int] = []
     user_code: str | None = None
-    is_activated: bool = True
     is_superadmin: bool = False
-    sites_limit: int | None = None
-    posts_limit: int | None = None
-    activated_at: str | None = None
-    requires_activation: bool = False
-    account_code: str | None = None
-    authorized_device_id: str | None = None
-
-
-class ActivationRequest(BaseModel):
-    code: str
-
-
-class ActivateAccountRequest(BaseModel):
-    login: str
-    activation_code: str
-
-    @field_validator("login")
-    @classmethod
-    def validate_login(cls, v):
-        if not v or not v.strip():
-            raise ValueError("Le login est obligatoire.")
-        return v.strip()
-
-    @field_validator("activation_code")
-    @classmethod
-    def validate_code(cls, v):
-        if not v or not v.strip():
-            raise ValueError("Le code d'activation est obligatoire.")
-        return v.strip().upper()
 
 
 class LoginRequest(BaseModel):
@@ -77,12 +47,25 @@ class LoginRequest(BaseModel):
 class LoginResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    refresh_token: str = ""
     user: UserInfo
 
 
-class ActivateAccountResponse(BaseModel):
-    success: bool
-    message: str
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+    @field_validator("refresh_token")
+    @classmethod
+    def validate_refresh_token(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Le token de renouvellement est obligatoire.")
+        return v.strip()
+
+
+class RefreshResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    refresh_token: str
 
 
 class MessageResponse(BaseModel):
@@ -101,18 +84,12 @@ class UserListItem(BaseModel):
     profile_id: int
     profile_name: str
     is_active: bool
-    is_activated: bool = True
     is_superadmin: bool = False
-    sites_limit: int | None = None
-    posts_limit: int | None = None
     created_at: str | None = None
     client_name: str | None = None
     admin_id: int | None = None
     admin_login: str | None = None
     admin_code: str | None = None
-    account_code: str | None = None
-    requires_activation: bool = False
-    authorized_device_id: str | None = None
 
 
 class UserListResponse(BaseModel):
@@ -129,7 +106,6 @@ class UserCreateRequest(BaseModel):
     profile_id: int
     admin_id: int | None = None
     is_active: bool = True
-    requires_activation: bool = False
     zones: list[int] = []
     groups: list[int] = []
     permissions: list[dict] = []
@@ -180,8 +156,6 @@ class UserCreatedResponse(BaseModel):
     user_id: int
     login: str
     user_code: str | None = None
-    account_code: str | None = None
-    requires_activation: bool = True
 
 
 class UserUpdateRequest(BaseModel):
@@ -191,7 +165,6 @@ class UserUpdateRequest(BaseModel):
     profile_id: int
     admin_id: int | None = None
     is_active: bool = True
-    requires_activation: bool = False
     zones: list[int] = []
     groups: list[int] = []
     permissions: list[dict] = []
@@ -268,20 +241,13 @@ class UserDetailResponse(BaseModel):
     profile_name: str
     is_active: bool
     must_change_password: bool
-    is_activated: bool = True
     is_superadmin: bool = False
-    sites_limit: int | None = None
-    posts_limit: int | None = None
-    activated_at: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
     last_login_at: str | None = None
     zones: list[ZoneAccessItem] = []
     groups: list[int] = []
     permissions: list[PermissionInfo] = []
-    account_code: str | None = None
-    requires_activation: bool = False
-    authorized_device_id: str | None = None
     admin_id: int | None = None
 
 
@@ -338,6 +304,9 @@ class AdminListItem(BaseModel):
     is_superadmin: bool = False
     client_codes: list[str] = []
     created_at: str | None = None
+    # Renseigné quand le client a été déduit automatiquement (aucun client
+    # sélectionné à l'enregistrement) plutôt qu'explicitement choisi.
+    auto_assigned_client: str | None = None
 
 
 class AdminListResponse(BaseModel):
@@ -473,3 +442,33 @@ class AdminClientAssignRequest(BaseModel):
         if not c:
             raise ValueError("Le code client est obligatoire.")
         return c
+
+
+class ClientCreateRequest(BaseModel):
+    client_code: str
+    client_name: str | None = None
+    license_sites: int = 0
+    license_posts: int = 0
+
+    @field_validator("client_code")
+    @classmethod
+    def normalize_code(cls, v):
+        c = (v or "").strip().upper()
+        if not c:
+            raise ValueError("Le code client est obligatoire.")
+        return c
+
+    @field_validator("client_name")
+    @classmethod
+    def normalize_name(cls, v):
+        if v is None:
+            return None
+        n = v.strip()
+        return n or None
+
+    @field_validator("license_sites", "license_posts")
+    @classmethod
+    def non_negative(cls, v):
+        if v < 0:
+            raise ValueError("Les licences doivent être positives ou nulles.")
+        return v

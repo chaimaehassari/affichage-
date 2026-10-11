@@ -10,38 +10,20 @@ from app.db.database import get_db
 from app.dependencies.auth import get_current_user_dependency
 from app.schemas.auth import (
     LoginRequest, LoginResponse, MessageResponse, UserInfo,
-    ForgotPasswordRequest, ResetPasswordRequest, ActivationRequest,
-    ActivateAccountRequest, ActivateAccountResponse,
+    ForgotPasswordRequest, ResetPasswordRequest,
+    RefreshRequest, RefreshResponse,
 )
 from app.services.auth_service import AuthService, _build_user_info
 from app.services.audit_service import log_action
 from app.services.mail_service import send_reset_email
 from app.services.user_service import UserService
 from app.services.settings_service import SettingsService
-from app.core.security import hash_password, create_access_token, verify_supreme_admin_code
+from app.core.security import (
+    hash_password, create_access_token, create_refresh_token,
+    decode_refresh_token, verify_supreme_admin_code,
+)
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
-
-DEVICE_HEADER = "X-Device-Id"
-
-
-def _get_device_id(request: Request | None) -> str | None:
-    if not request:
-        return None
-    value = request.headers.get(DEVICE_HEADER)
-    if value:
-        value = value.strip()
-    return value or None
-
-
-def _require_device(request: Request | None) -> str:
-    device_id = _get_device_id(request)
-    if not device_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="L'identifiant de l'appareil (header X-Device-Id) est obligatoire.",
-        )
-    return device_id
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -60,86 +42,7 @@ def login(data: LoginRequest, db: Connection = Depends(get_db), request: Request
             detail="Identifiant, mot de passe ou code client incorrect.",
         )
 
-    device_id = _get_device_id(request)
-    gate_result = _apply_login_device_gate(db, service, data.login, device_id)
-    if gate_result is not None:
-        return gate_result
     return result
-
-
-def _apply_login_device_gate(
-    db: Connection,
-    service: AuthService,
-    login: str,
-    device_id: str | None,
-) -> LoginResponse | None:
-    """Applique le verrou Appareil / Activation au login d'un compte non-superadmin.
-
-    - Admin suprême : exempté (géré avant par _try_supreme_admin_login).
-    - Compte en attente d'activation (requires_activation) : bloqué (403) avec
-      son account_code dans le corps de réponse pour permettre l'activation.
-    - Compte lié à un autre appareil : bloqué (403).
-    - Compte sans appareil lié : liaison silencieuse puis connexion.
-    """
-    row = db.execute(
-        """
-        SELECT u.*, p.name AS profile_name
-        FROM users u
-        LEFT JOIN profiles p ON p.profile_id = u.profile_id
-        WHERE u.login = %s
-        """,
-        (login,),
-    ).fetchone()
-    if not row or row["is_superadmin"]:
-        return None
-
-    if not device_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="L'identifiant de l'appareil (header X-Device-Id) est obligatoire.",
-        )
-
-    account_code = service.ensure_account_code(row)
-    if account_code != row.get("account_code"):
-        db.commit()
-
-    if bool(row.get("requires_activation")):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "code": "account_activation_required",
-                "account_code": account_code,
-                "message": "Ce compte doit être activé par un code d'activation.",
-            },
-        )
-
-    bound_device = row.get("authorized_device_id")
-    if bound_device and bound_device != device_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "code": "device_change_activation_required",
-                "account_code": account_code,
-                "message": "Ce compte est lié à un autre appareil. "
-                           "Contactez l'administrateur ou activez le compte avec un code d'activation.",
-            },
-        )
-
-    if bound_device != device_id:
-        service.bind_device(row["user_id"], device_id)
-        fresh = db.execute(
-            """
-            SELECT u.*, p.name AS profile_name
-            FROM users u
-            LEFT JOIN profiles p ON p.profile_id = u.profile_id
-            WHERE u.user_id = %s
-            """,
-            (row["user_id"],),
-        ).fetchone()
-        user_info = _build_user_info(db, fresh)
-        return LoginResponse(access_token=create_access_token(row["user_id"]), user=user_info)
-
-    return None
 
 
 def _try_supreme_admin_login(db: Connection, data: LoginRequest, request: Request) -> LoginResponse | None:
@@ -178,51 +81,69 @@ def _try_supreme_admin_login(db: Connection, data: LoginRequest, request: Reques
 
     token = create_access_token(user["user_id"])
     user_info = _build_user_info(db, user)
-    return LoginResponse(access_token=token, user=user_info)
+    return LoginResponse(
+        access_token=token,
+        refresh_token=create_refresh_token(user["user_id"]),
+        user=user_info,
+    )
+
+
+@router.post("/refresh", response_model=RefreshResponse)
+def refresh_access_token(
+    data: RefreshRequest,
+    db: Connection = Depends(get_db),
+    request: Request = None,
+):
+    """Renouvelle un token d'accès expiré à partir d'un token typ=refresh.
+
+    Le token d'accès ne dure que 30 min (ACCESS_TOKEN_EXPIRE_MINUTES) et n'a
+    aucune contrepartie de renouvellement : sans cet endpoint, laisser un
+    onglet ouvert plus de 30 min transformait la session en cascade de 401 —
+    une par requête déjà partie. Le client tente ce renouvellement UNE fois
+    (verrou côté client), rejoue la requête, et ne déconnecte que si l'échec
+    est définitif.
+
+    Distinction de sécurité : un token typ=refresh ne peut PAS servir à
+    appeler l'API (`decode_access_token` refuse tout typ != "access").
+    """
+    payload = decode_refresh_token(data.refresh_token)
+    if payload is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token de renouvellement invalide ou expiré.",
+        )
+
+    try:
+        user_id = int(payload.get("sub"))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token de renouvellement invalide.",
+        )
+
+    # Un compte désactivé/supprimé entre-temps ne se renouvelle pas, même si
+    # son token de renouvellement est encore valide.
+    service = AuthService(db)
+    user = service.get_current_user(user_id)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Utilisateur introuvable ou désactivé.",
+        )
+
+    ip = request.client.host if request and request.client else None
+    log_action(db, user_id, "ACCESS_TOKEN_REFRESH", "user", user_id,
+               "Renouvellement du token d'accès", ip_address=ip)
+
+    return RefreshResponse(
+        access_token=create_access_token(user_id),
+        refresh_token=create_refresh_token(user_id),
+    )
 
 
 @router.get("/me", response_model=UserInfo)
 def get_me(current_user: UserInfo = Depends(get_current_user_dependency)):
     return current_user
-
-
-@router.post("/activate", response_model=UserInfo)
-def activate_account(
-    data: ActivationRequest,
-    current_user: UserInfo = Depends(get_current_user_dependency),
-    db: Connection = Depends(get_db),
-):
-    """Active le compte du client connecté avec un code de sérialisation.
-
-    Le code est validé HMAC. Son n° de client doit correspondre au
-    user_code du compte connecté. Les limites sites/posts sont alors
-    stockées sur le compte et l'accès à l'application est débloqué.
-    """
-    service = AuthService(db)
-    try:
-        return service.activate_account(current_user.user_id, data.code)
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-
-
-@router.post("/activate-account", response_model=ActivateAccountResponse)
-def activate_account_device(
-    data: ActivateAccountRequest,
-    db: Connection = Depends(get_db),
-    request: Request = None,
-):
-    """Active un compte avec un code d'activation et le lie à l'appareil courant.
-
-    Le code d'activation est unique à chaque compte (account_code), signé
-    HMAC-SHA256 et limité dans le temps. Prérequis : header X-Device-Id.
-    """
-    device_id = _require_device(request)
-    service = AuthService(db)
-    try:
-        result = service.activate_device_account(data.login, data.activation_code, device_id)
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    return ActivateAccountResponse(success=True, message=result["message"])
 
 
 @router.get("/logins")

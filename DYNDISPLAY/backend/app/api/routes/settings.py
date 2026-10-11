@@ -3,13 +3,12 @@ from psycopg import Connection
 from datetime import datetime, timezone
 
 from app.db.database import get_db
-from app.dependencies.auth import get_current_user_dependency, require_permission, require_superadmin
+from app.dependencies.auth import get_current_user_dependency, require_admin, require_superadmin
 from app.core.security import verify_password, hash_password, verify_supreme_admin_code
 from app.schemas.settings import (
     SettingsOut, SettingsUpdate, ClientCodeVerify, ChangePasswordRequest,
-    LicenseUpdateRequest, AccessPasswordVerify, ChangeAccessPasswordRequest,
+    AccessPasswordVerify,
     FtpProfileCreate, FtpProfileUpdate, FtpProfileOut, FtpTestRequest, FtpTestResult,
-    AccountDeviceOut, AccountDeviceListResponse, RevokeDeviceResponse,
 )
 from app.services.settings_service import SettingsService, FtpProfileService
 from app.services.user_service import UserService
@@ -75,52 +74,76 @@ def change_password(
 @router.post("/settings/verify-access")
 def verify_access_password(
     payload: AccessPasswordVerify,
-    current_user=Depends(require_permission("menu_config")),
+    current_user=Depends(require_admin),
     db: Connection = Depends(get_db),
     request: Request = None,
 ):
-    service = SettingsService(db)
-    if not service.verify_access_password(payload.password, current_user.login):
-        log_action(db, current_user.user_id, "supreme_admin_access_denied", "settings", None,
-                   "Tentative d'accès paramètres échouée (code incorrect)",
+    """Déverrouille la page Paramètres avec le mot de passe de connexion.
+
+    Il n'existe plus de mot de passe d'accès dédié aux paramètres : chaque
+    Administrateur s'authentifie avec SON propre mot de passe (users.password_hash).
+    Les onglets réservés au Super Admin restent protégés par require_superadmin
+    sur leurs propres routes (GET/PUT /settings, /ftp-profiles, ...).
+
+    Cas particulier de l'Admin suprême : `POST /auth/login` l'accepte avec le
+    CODE DU JOUR (`_try_supreme_admin_login`, cf. routes/auth.py), qui n'est pas
+    son mot de passe de compte. Ne retenir que `password_hash` rendait la page
+    Paramètres inaccessible au Super Admin : la chaîne qui venait d'ouvrir
+    l'application était rejetée par la porte suivante. On accepte donc le même
+    code, aux mêmes conditions que la connexion (`verify_supreme_admin_code` +
+    compte actif et non suspendu), et UNIQUEMENT pour un compte is_superadmin :
+    un Admin classique doit toujours présenter son propre mot de passe.
+    """
+    row = db.execute(
+        """
+        SELECT password_hash, is_superadmin, suspended_at
+        FROM users
+        WHERE user_id = %s
+        """,
+        (current_user.user_id,),
+    ).fetchone()
+    valid = bool(
+        row
+        and row["suspended_at"] is None
+        and (
+            verify_password(payload.password, row["password_hash"])
+            or (
+                row["is_superadmin"]
+                and verify_supreme_admin_code(payload.password, current_user.login)
+            )
+        )
+    )
+    if not valid:
+        log_action(db, current_user.user_id, "settings_access_denied", "settings", None,
+                   "Tentative d'accès paramètres échouée (mot de passe incorrect)",
                    ip_address=request.client.host if request and request.client else None)
-        raise HTTPException(status_code=401, detail="Mot de passe d'accès incorrect.")
-    log_action(db, current_user.user_id, "supreme_admin_access_granted", "settings", None,
+        raise HTTPException(status_code=401, detail="Mot de passe incorrect.")
+    log_action(db, current_user.user_id, "settings_access_granted", "settings", None,
                "Accès paramètres autorisé",
                ip_address=request.client.host if request and request.client else None)
     return {"valid": True}
 
 
-@router.post("/settings/change-access-password")
-def change_access_password(
-    payload: ChangeAccessPasswordRequest,
-    current_user=Depends(require_permission("menu_config")),
+@router.get("/settings/session-timeout")
+def get_session_timeout(
+    current_user=Depends(get_current_user_dependency),
     db: Connection = Depends(get_db),
 ):
-    user = db.execute(
-        """
-        SELECT u.*, p.name AS profile_name
-        FROM users u
-        JOIN profiles p ON p.profile_id = u.profile_id
-        WHERE u.user_id = %s
-        """,
-        (current_user.user_id,),
-    ).fetchone()
-    if not user or user["profile_name"] != "Administrateur":
-        raise HTTPException(status_code=403, detail="Seul un Administrateur peut modifier ce mot de passe.")
+    """Durée d'inactivité avant verrouillage, lisible par TOUT utilisateur.
 
+    SessionLock est monté sur toutes les routes protégées, pas seulement pour
+    les Administrateurs : un compte client ou un utilisateur simple était donc
+    servi en 403 à chaque changement de page. Le réglage n'est qu'une durée
+    d'inactivité, sans donnée sensible, et le verrouillage doit s'appliquer à
+    tout le monde. GET /settings reste réservé au Super Admin.
+    """
     service = SettingsService(db)
-    if not service.verify_access_password(payload.current_password):
-        raise HTTPException(status_code=400, detail="Mot de passe d'accès actuel incorrect.")
-    service.set_access_password(payload.new_password)
-    log_action(db, current_user.user_id, "change_access_password", "general_settings", None,
-               "Modification du mot de passe d'accès aux paramètres")
-    return {"success": True, "message": "Mot de passe d'accès aux paramètres modifié."}
+    return {"session_timeout_minutes": service.get_session_timeout_minutes()}
 
 
 @router.post("/settings/regenerate-client-code")
 def regenerate_client_code(
-    current_user=Depends(require_permission("menu_config")),
+    current_user=Depends(require_superadmin),
     db: Connection = Depends(get_db),
 ):
     import secrets
@@ -135,7 +158,7 @@ def regenerate_client_code(
 
 @router.get("/settings")
 def get_settings(
-    current_user=Depends(require_permission("menu_config")),
+    current_user=Depends(require_superadmin),
     db: Connection = Depends(get_db),
 ):
     service = SettingsService(db)
@@ -149,7 +172,7 @@ def get_settings(
 @router.put("/settings")
 def update_settings(
     payload: SettingsUpdate,
-    current_user=Depends(require_permission("menu_config")),
+    current_user=Depends(require_superadmin),
     db: Connection = Depends(get_db),
 ):
     service = SettingsService(db)
@@ -161,28 +184,9 @@ def update_settings(
     return result
 
 
-@router.post("/settings/license/update")
-def update_licenses(
-    payload: LicenseUpdateRequest,
-    current_user=Depends(require_permission("menu_config")),
-    db: Connection = Depends(get_db),
-):
-    service = SettingsService(db)
-    try:
-        result = service.update_licenses(payload.code)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    used = service.count_used_licenses()
-    result["used_sites"] = used["used_sites"]
-    result["used_posts"] = used["used_posts"]
-    log_action(db, current_user.user_id, "update_licenses", "general_settings", None,
-               f"Licences modifiées : {payload.sites} sites, {payload.posts} postes")
-    return result
-
-
 @router.get("/ftp-profiles")
 def list_ftp_profiles(
-    current_user=Depends(require_permission("menu_config")),
+    current_user=Depends(require_superadmin),
     db: Connection = Depends(get_db),
 ):
     service = FtpProfileService(db)
@@ -192,7 +196,7 @@ def list_ftp_profiles(
 @router.post("/ftp-profiles", status_code=201)
 def create_ftp_profile(
     payload: FtpProfileCreate,
-    current_user=Depends(require_permission("menu_config")),
+    current_user=Depends(require_superadmin),
     db: Connection = Depends(get_db),
 ):
     service = FtpProfileService(db)
@@ -206,7 +210,7 @@ def create_ftp_profile(
 def update_ftp_profile(
     profile_id: int,
     payload: FtpProfileUpdate,
-    current_user=Depends(require_permission("menu_config")),
+    current_user=Depends(require_superadmin),
     db: Connection = Depends(get_db),
 ):
     service = FtpProfileService(db)
@@ -219,7 +223,7 @@ def update_ftp_profile(
 @router.delete("/ftp-profiles/{profile_id}")
 def delete_ftp_profile(
     profile_id: int,
-    current_user=Depends(require_permission("menu_config")),
+    current_user=Depends(require_superadmin),
     db: Connection = Depends(get_db),
 ):
     service = FtpProfileService(db)
@@ -233,55 +237,8 @@ def delete_ftp_profile(
 @router.post("/settings/test-ftp")
 def test_ftp(
     payload: FtpTestRequest,
-    current_user=Depends(require_permission("menu_config")),
+    current_user=Depends(require_superadmin),
     db: Connection = Depends(get_db),
 ):
     service = FtpProfileService(db)
     return service.test_connection(payload.profile_id)
-
-
-# --- Activation par compte / appareils (réservé au Super Admin) ---
-
-
-@router.get("/settings/accounts/devices", response_model=AccountDeviceListResponse)
-def list_account_devices(
-    current_user=Depends(require_superadmin),
-    db: Connection = Depends(get_db),
-):
-    service = SettingsService(db)
-    accounts = service.list_account_devices()
-    license_posts = service.get_license_posts()
-    activated = service.count_activated_accounts()
-    return AccountDeviceListResponse(
-        accounts=[AccountDeviceOut(**a) for a in accounts],
-        total=len(accounts),
-        license_posts=license_posts,
-        activated_accounts=activated,
-        available_slots=max(license_posts - activated, 0),
-    )
-
-
-@router.post("/settings/accounts/{user_id}/revoke-device", response_model=RevokeDeviceResponse)
-def revoke_account_device(
-    user_id: int,
-    current_user=Depends(require_superadmin),
-    db: Connection = Depends(get_db),
-):
-    if user_id == current_user.user_id:
-        raise HTTPException(status_code=400, detail="Impossible de libérer votre propre appareil.")
-
-    from app.services.audit_service import log_action
-    service = SettingsService(db)
-    try:
-        result = service.revoke_device(user_id)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    if result is None:
-        raise HTTPException(status_code=404, detail="Utilisateur introuvable.")
-
-    log_action(db, current_user.user_id, "device_revoke", "user", user_id,
-               f"Appareil libéré pour le compte {user_id}")
-    return RevokeDeviceResponse(
-        success=True,
-        message="Appareil libéré. Le prochain appareil qui se connectera avec ce compte sera automatiquement autorisé.",
-    )

@@ -68,23 +68,6 @@ def require_permission(permission_code: str):
     return dependency
 
 
-def require_activated(
-    current_user: UserInfo = Depends(get_current_user_dependency),
-) -> UserInfo:
-    """Bloque les comptes clients non activés (sauf administrateur).
-
-    Un compte en attente d'activation ne peut toucher aucune donnée :
-    il doit d'abord saisir son code de sérialisation (POST /auth/activate,
-    qui vit dans le routeur auth, non soumis à ce garde-fou).
-    """
-    if not is_admin_user(current_user) and not current_user.is_activated:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Votre compte doit être activé par un code de sérialisation.",
-        )
-    return current_user
-
-
 def require_superadmin(
     current_user: UserInfo = Depends(get_current_user_dependency),
 ) -> UserInfo:
@@ -98,6 +81,31 @@ def require_superadmin(
             detail="Réservé au Super Admin.",
         )
     return current_user
+
+
+def require_superadmin_with_permission(permission_code: str):
+    """Exige la permission demandée ET le statut Super Admin.
+
+    `require_permission` laisse passer tout Administrateur (Super Admin ou Admin
+    classique) : c'est le comportement voulu pour LIRE. Pour ÉCRIRE une
+    ressource qui n'appartient à personne en particulier — les modèles de
+    découpage, partagés par tous les clients — ce n'est plus acceptable : un
+    Admin classique pourrait alors modifier un modèle utilisé par les postes
+    d'un autre client, puisque `layouts` n'a aucune colonne client.
+
+    On garde la vérification de permission pour ne pas élargir l'accès des
+    comptes non administrateurs : la contrainte est une conjonction des deux.
+    """
+    def dependency(
+        current_user: UserInfo = Depends(require_permission(permission_code)),
+    ) -> UserInfo:
+        if not is_admin_user(current_user) or not getattr(current_user, "is_superadmin", False):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Réservé au Super Admin.",
+            )
+        return current_user
+    return dependency
 
 
 def require_admin(
@@ -157,10 +165,5 @@ def require_media_access(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Utilisateur introuvable ou désactivé.",
-        )
-    if not is_admin_user(user) and not user.is_activated:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Votre compte doit être activé par un code de sérialisation.",
         )
     return user

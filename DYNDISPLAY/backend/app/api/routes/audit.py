@@ -4,6 +4,7 @@ from psycopg import Connection
 from app.db.database import get_db
 from app.dependencies.auth import get_current_user_dependency
 from app.schemas.auth import UserInfo
+from app.services.scope import audit_scope_sql
 
 router = APIRouter(prefix="/api/v1/audit", tags=["Audit"])
 
@@ -25,19 +26,37 @@ def list_audit_logs(
     current_user=Depends(_get_admin_user),
     db: Connection = Depends(get_db),
 ):
-    params = []
-    where = ""
+    """Journaux d'audit DU PÉRIMÈTRE de l'utilisateur connecté.
+
+    Le filtre vient de `audit_scope_sql()` (source de vérité unique, dans
+    scope.py). Avant, la requête ne portait AUCUN filtre : n'importe quel
+    Administrateur recevait la table entière — 33 631 journaux, y compris les
+    licences de clients qui ne lui sont pas affectés.
+    """
+    conditions: list[str] = []
+    params: list = []
+
     if entity_type:
-        where = "WHERE al.entity_type = %s"
+        conditions.append("al.entity_type = %s")
         params.append(entity_type)
 
-    total = db.execute(f"SELECT COUNT(*) AS c FROM audit_logs al {where}", params).fetchone()
+    join_sql, frag, frag_params = audit_scope_sql(db, current_user, "al")
+    if frag:
+        conditions.append(frag)
+    params.extend(frag_params)
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    total = db.execute(
+        f"SELECT COUNT(*) AS c FROM audit_logs al {join_sql} {where}", params
+    ).fetchone()
     rows = db.execute(
         f"""
         SELECT al.audit_id, al.user_id, u.login AS user_login, al.action,
                al.entity_type, al.entity_id, al.description, al.ip_address, al.created_at
         FROM audit_logs al
         LEFT JOIN users u ON u.user_id = al.user_id
+        {join_sql}
         {where}
         ORDER BY al.created_at DESC, al.audit_id DESC
         LIMIT %s OFFSET %s

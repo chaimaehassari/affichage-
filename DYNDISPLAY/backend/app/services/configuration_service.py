@@ -8,7 +8,16 @@ from app.schemas.configuration import (
     ScheduleUpdate,
     ZoneMediaAssignment,
 )
+from app.services.reboot_schedule_service import (
+    compute_next_reboot_at,
+    refresh_next_reboot_at,
+    refresh_reboot_once_at,
+    time_column_str,
+    validate_reboot_time,
+)
 from app.services.zone_access import assert_zone_allowed
+from app.services.scope import assert_media_ids_in_scope
+from app.core.times import to_utc
 
 
 def _schedule_dict(s: dict) -> dict:
@@ -156,6 +165,9 @@ class ConfigurationService:
             (post_id,),
         ).fetchall()
 
+        reboot = refresh_next_reboot_at(self.conn, post_id)
+        once = refresh_reboot_once_at(self.conn, post_id)
+
         return {
             "post_id": post["post_id"],
             "code": post["code"],
@@ -165,10 +177,15 @@ class ConfigurationService:
             "loop_enabled": config["loop_enabled"],
             "schedule_enabled": config["schedule_enabled"],
             "display_enabled": config["display_enabled"],
+            "reboot_enabled": reboot["reboot_enabled"],
+            "reboot_time": reboot["reboot_time"],
+            "next_reboot_at": reboot["next_reboot_at"],
+            "reboot_once_at": once["reboot_once_at"],
             "schedules": [_schedule_dict(s) for s in schedules],
         }
 
-    def update_configuration(self, post_id: int, data: PostConfigurationUpdate, user_id: int) -> dict:
+    def update_configuration(self, post_id: int, data: PostConfigurationUpdate, user_id: int,
+                             scope=None) -> dict:
         post = self.conn.execute(
             "SELECT * FROM posts WHERE post_id = %s",
             (post_id,),
@@ -199,14 +216,40 @@ class ConfigurationService:
              datetime.now(timezone.utc), post_id),
         )
 
+        reboot_enabled = bool(post.get("reboot_enabled", 0)) if "reboot_enabled" in post else False
+        reboot_time = time_column_str(post.get("reboot_time"))
+        if data.reboot_time is not None:
+            reboot_time = validate_reboot_time(data.reboot_time)
+        if data.reboot_enabled is not None:
+            reboot_enabled = data.reboot_enabled
+        if reboot_enabled and not reboot_time:
+            raise ValueError("L'heure de redémarrage est obligatoire.")
+        next_reboot_at = (
+            compute_next_reboot_at(reboot_time) if (reboot_enabled and reboot_time) else None
+        )
+        # Ponctuel : absent du payload -> valeur conservée ; null explicite ->
+        # annulation ; une valeur -> validée par le schéma puis stockée en UTC.
+        # reboot_once_at est indépendant du récurrent.
+        if "reboot_once_at" in data.model_fields_set:
+            reboot_once_at = to_utc(data.reboot_once_at) if data.reboot_once_at is not None else None
+        else:
+            reboot_once_at = post.get("reboot_once_at")
+        self.conn.execute(
+            "UPDATE posts SET reboot_enabled = %s, reboot_time = %s, next_reboot_at = %s, "
+            "reboot_once_at = %s, updated_at = %s WHERE post_id = %s",
+            (reboot_enabled, reboot_time, next_reboot_at, reboot_once_at,
+             datetime.now(timezone.utc), post_id),
+        )
+
         for assignment in data.zones:
             assert_zone_allowed(self.conn, user_id, assignment.zone_number)
 
-        self._rebuild_zones_playlists(post_id, data.zones)
+        self._rebuild_zones_playlists(post_id, data.zones, scope=scope, viewer_user_id=user_id)
 
         return self.get_configuration(post_id)
 
-    def update_zones(self, post_id: int, zones: list[ZoneMediaAssignment], user_id: int) -> None:
+    def update_zones(self, post_id: int, zones: list[ZoneMediaAssignment], user_id: int,
+                     scope=None) -> None:
         post = self.conn.execute(
             "SELECT * FROM posts WHERE post_id = %s",
             (post_id,),
@@ -217,9 +260,19 @@ class ConfigurationService:
         for assignment in zones:
             assert_zone_allowed(self.conn, user_id, assignment.zone_number)
 
-        self._rebuild_zones_playlists(post_id, zones)
+        self._rebuild_zones_playlists(post_id, zones, scope=scope, viewer_user_id=user_id)
 
-    def _rebuild_zones_playlists(self, post_id: int, assignments: list) -> None:
+    def _rebuild_zones_playlists(self, post_id: int, assignments: list,
+                                 scope=None, viewer_user_id: int | None = None) -> None:
+        # Tout est validé AVANT le premier DELETE : cette méthode efface les
+        # zones du poste puis les recrée, donc un média refusé en cours de
+        # boucle laisserait le poste sans aucune zone alors que la requête
+        # entière a été rejetée.
+        assert_media_ids_in_scope(
+            self.conn, scope, viewer_user_id,
+            [getattr(a, "media_id", None) for a in assignments],
+        )
+
         grouped = {}
         for a in assignments:
             grouped.setdefault(a.zone_number, []).append(a)

@@ -1,5 +1,7 @@
 from pydantic import BaseModel, field_validator
 
+from app.services.reboot_schedule_service import validate_reboot_time
+
 
 class MessageResponse(BaseModel):
     message: str
@@ -61,6 +63,11 @@ class PostCreate(BaseModel):
     player_type: str | None = None
     ip_address: str | None = None
     is_active: bool = True
+    # Redémarrage automatique quotidien, saisissable DÈS la création du poste
+    # (formulaire d'informations de la box). Même couple de champs que la page
+    # de configuration d'affichage : une seule source de vérité en base.
+    reboot_enabled: bool = False
+    reboot_time: str | None = None
 
     @field_validator("code")
     @classmethod
@@ -68,6 +75,11 @@ class PostCreate(BaseModel):
         if not v or not v.strip():
             raise ValueError("Le code est obligatoire.")
         return v.strip()
+
+    @field_validator("reboot_time")
+    @classmethod
+    def validate_reboot_time(cls, v):
+        return validate_reboot_time(v) if v is not None else None
 
 
 class PostUpdate(BaseModel):
@@ -77,6 +89,14 @@ class PostUpdate(BaseModel):
     player_type: str | None = None
     ip_address: str | None = None
     is_active: bool = True
+    # `None` = ne pas toucher au mécanisme de redémarrage (PUT envoyé par un
+    # client qui ignore ce champ ne doit pas désactiver une planification
+    # existante) ; `True`/`False` = activation/désactivation explicite.
+    reboot_enabled: bool | None = None
+    # Absent, vide ou null = conserver l'heure déjà enregistrée : désactiver
+    # ne doit pas perdre l'heure (même convention que migration 021 et que
+    # l'écran de configuration d'affichage).
+    reboot_time: str | None = None
 
     @field_validator("code")
     @classmethod
@@ -84,6 +104,11 @@ class PostUpdate(BaseModel):
         if not v or not v.strip():
             raise ValueError("Le code est obligatoire.")
         return v.strip()
+
+    @field_validator("reboot_time")
+    @classmethod
+    def validate_reboot_time(cls, v):
+        return validate_reboot_time(v) if v is not None else None
 
 
 class PostOut(BaseModel):
@@ -100,6 +125,13 @@ class PostOut(BaseModel):
     last_sync_at: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
+    reboot_enabled: bool = False
+    reboot_time: str | None = None
+    next_reboot_at: str | None = None
+    # Client effectif du poste, hérité de son SITE : la table `posts` n'a pas de
+    # colonne client. Sans ce champ, l'écran Sites & Postes affichait tous les
+    # postes comme « sans client », y compris ceux d'un autre client.
+    client_code: str | None = None
 
 
 # --- Screen Groups ---
@@ -212,6 +244,27 @@ class BatchAssignMediaRequest(BaseModel):
 class BatchAssignResponse(BaseModel):
     success_count: int
     failed_ids: list[int]
+
+
+# --- Batch Reboot Schedule ---
+
+class BatchRebootScheduleRequest(BaseModel):
+    post_ids: list[int]
+    reboot_enabled: bool
+    reboot_time: str | None = None
+    sync: bool = True
+
+
+class BatchRebootFailure(BaseModel):
+    post_id: int
+    reason: str
+
+
+class BatchRebootScheduleResponse(BaseModel):
+    success_count: int
+    failed_ids: list[int]
+    synced_post_ids: list[int]
+    failed_posts: list["BatchRebootFailure"] = []
 
 
 # --- Media ---

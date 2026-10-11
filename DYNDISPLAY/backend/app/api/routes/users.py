@@ -18,35 +18,38 @@ from app.schemas.auth import (
     PasswordResetRequest,
 )
 from app.services.audit_service import log_action
-from app.services.scope import client_scope, is_regular_admin, site_in_scope, user_owner_user_id
+from app.services.scope import (
+    admin_client_codes,
+    client_scope,
+    is_regular_admin,
+    site_in_scope,
+    target_user_in_scope,
+    user_owner_user_id,
+)
 from app.services.user_service import UserService
 
 router = APIRouter(prefix="/api/v1/users", tags=["Users"])
 
 
-def _check_scope(db, current_user, *, user_code=None, admin_id=None):
-    """Vérifie que la cible appartient au périmètre de l'utilisateur connecté.
+def _check_scope(db, current_user, *, target_user_id=None):
+    """Vérifie qu'un compte cible appartient au périmètre de l'utilisateur connecté.
 
-    - Super Admin → toujours autorisé.
-    - Admin classique → uniquement les utilisateurs qui lui sont affectés
-      (users.admin_id = son user_id).
-    - Compte client → uniquement les utilisateurs de son code client.
+    Source de vérité unique : `target_user_in_scope()` (voir scope.py), utilisée
+    aussi bien par la liste que par l'édition et la suppression. Avant, la liste
+    et l'édition appliquaient deux règles différentes — un compte pouvait être
+    listé puis refusé à la modification.
     """
+    if target_user_in_scope(db, current_user, target_user_id):
+        return
     if is_regular_admin(current_user):
-        if admin_id and int(admin_id) == current_user.user_id:
-            return
         raise HTTPException(
             status_code=403,
             detail="Vous ne pouvez gérer que les utilisateurs qui vous sont affectés.",
         )
-    scope = client_scope(db, current_user)
-    if scope is None:
-        return
-    if not site_in_scope(scope, user_code):
-        raise HTTPException(
-            status_code=403,
-            detail="Ce client ne fait pas partie de votre périmètre.",
-        )
+    raise HTTPException(
+        status_code=403,
+        detail="Ce compte ne fait pas partie de votre périmètre.",
+    )
 
 
 @router.get("", response_model=UserListResponse)
@@ -68,10 +71,7 @@ def list_users(
             profile_id=u["profile_id"],
             profile_name=u["profile_name"] or "",
             is_active=u["is_active"],
-            is_activated=bool(u.get("is_activated", True)),
             is_superadmin=bool(u.get("is_superadmin", False)),
-            sites_limit=u.get("sites_limit"),
-            posts_limit=u.get("posts_limit"),
             created_at=u["created_at"].isoformat() if u["created_at"] else None,
             client_name=u.get("client_name"),
             admin_id=u.get("admin_id"),
@@ -123,7 +123,7 @@ def get_user(
     if not user:
         raise HTTPException(status_code=404, detail="Utilisateur introuvable.")
 
-    _check_scope(db, current_user, user_code=user.get("user_code"), admin_id=user.get("admin_id"))
+    _check_scope(db, current_user, target_user_id=user_id)
 
     zones = service.get_user_zones(user_id)
     groups = service.get_user_groups(user_id)
@@ -138,12 +138,8 @@ def get_user(
         profile_name=user["profile_name"] or "",
         is_active=user["is_active"],
         must_change_password=user["must_change_password"],
-        is_activated=bool(user.get("is_activated", True)),
         is_superadmin=bool(user.get("is_superadmin", False)),
-        sites_limit=user.get("sites_limit"),
-        posts_limit=user.get("posts_limit"),
         admin_id=user.get("admin_id"),
-        activated_at=user["activated_at"].isoformat() if user.get("activated_at") else None,
         created_at=user["created_at"].isoformat() if user["created_at"] else None,
         updated_at=user["updated_at"].isoformat() if user["updated_at"] else None,
         last_login_at=user["last_login_at"].isoformat() if user["last_login_at"] else None,
@@ -159,10 +155,42 @@ def create_user(
     current_user=Depends(require_permission("user_create")),
     db: Connection = Depends(get_db),
 ):
-    if is_regular_admin(current_user):
-        data.admin_id = current_user.user_id
-    _check_scope(db, current_user, user_code=data.user_code, admin_id=data.admin_id)
     service = UserService(db)
+    if is_regular_admin(current_user):
+        # Un Admin classique ne rattache un compte qu'à un client de son
+        # périmètre. Créer un client se fait explicitement via POST
+        # /api/v1/clients (source unique, auto-affectation à l'admin) : un
+        # code hors périmètre — qu'il existe déjà (client d'un autre admin)
+        # ou qu'il soit inconnu — est donc refusé, sans jamais affecter ou
+        # créer de client à la volée ici.
+        data.admin_id = current_user.user_id
+        codes = admin_client_codes(db, current_user)
+        requested = (data.user_code or "").strip().upper()
+        if requested:
+            if not site_in_scope(codes, requested):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Ce code client ne figure pas dans votre périmètre : "
+                           "créez le client via POST /api/v1/clients avant de "
+                           "rattacher un utilisateur.",
+                )
+            data.user_code = requested
+        elif len(codes) == 1:
+            data.user_code = codes[0]
+        elif not codes:
+            raise HTTPException(
+                status_code=400,
+                detail="Aucun client ne vous est affecté : saisissez le code "
+                       "d'un nouveau client pour le créer.",
+            )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Sélectionnez le client de rattachement du compte "
+                       f"parmi : {', '.join(codes)}.",
+            )
+    # Pas de _check_scope ici : le compte n'existe pas encore, son rattachement
+    # vient d'être validé ci-dessus (client de l'admin + admin_id forcé).
     try:
         user = service.create_user(data, current_user.user_id)
         return UserCreatedResponse(
@@ -170,8 +198,6 @@ def create_user(
             user_id=user["user_id"],
             login=user["login"],
             user_code=user.get("user_code"),
-            account_code=user.get("account_code"),
-            requires_activation=bool(user.get("requires_activation", True)),
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -185,10 +211,15 @@ def update_user(
     db: Connection = Depends(get_db),
 ):
     service = UserService(db)
-    existing = service.get_user(user_id)
-    if existing:
-        _check_scope(db, current_user, user_code=existing.get("user_code"), admin_id=existing.get("admin_id"))
-    _check_scope(db, current_user, user_code=data.user_code, admin_id=existing.get("admin_id") if existing else None)
+    _check_scope(db, current_user, target_user_id=user_id)
+    if is_regular_admin(current_user):
+        # Un Admin classique ne peut pas transferer la propriete d'un compte
+        # vers un autre administrateur : `admin_id` est la colonne qui definit
+        # l'appartenance d'un compte, donc la seule colonne qui pilote
+        # l'isolation de `GET /users`. On la force a sa valeur actuelle, ce qui
+        # neutralise un `admin_id` arbitraire envoye dans le corps de la
+        # requete. Le Super Admin, lui, conserve ce pouvoir.
+        data.admin_id = service.get_user(user_id).get("admin_id")
     try:
         user = service.update_user(user_id, data, current_user.user_id)
         return MessageResponse(message=f"Utilisateur {user['login']} modifié avec succès.")
@@ -208,7 +239,7 @@ def delete_user(
     service = UserService(db)
     existing = service.get_user(user_id)
     if existing:
-        _check_scope(db, current_user, user_code=existing.get("user_code"), admin_id=existing.get("admin_id"))
+        _check_scope(db, current_user, target_user_id=user_id)
     try:
         service.delete_user(user_id, current_user.user_id)
         return MessageResponse(message="Utilisateur supprimé avec succès.")
@@ -232,9 +263,11 @@ def reset_password(
         raise HTTPException(status_code=400, detail="Les mots de passe ne correspondent pas.")
 
     service = UserService(db)
-    existing = service.get_user(user_id)
-    if existing:
-        _check_scope(db, current_user, user_code=existing.get("user_code"), admin_id=existing.get("admin_id"))
+    # Controle inconditionnel (comme sur `PUT`) : le conditionner a
+    # l'existence du compte laissait passer un identifiant inconnu, et
+    # exposait au passage l'existence ou non d'un `user_id` via le code
+    # de reponse.
+    _check_scope(db, current_user, target_user_id=user_id)
     try:
         service.reset_password(user_id, data.new_password, current_user.user_id)
         return MessageResponse(message="Mot de passe réinitialisé avec succès.")

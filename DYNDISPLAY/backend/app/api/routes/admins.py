@@ -9,6 +9,7 @@ from app.schemas.auth import (
     AdminListItem,
     AdminListResponse,
     AdminUpdateRequest,
+    ClientCreateRequest,
     ClientDetailResponse,
     ClientItem,
     ClientLicenseUpdateRequest,
@@ -56,6 +57,7 @@ def _admin_item(admin: dict) -> AdminListItem:
         is_superadmin=bool(admin.get("is_superadmin", False)),
         client_codes=admin.get("client_codes") or [],
         created_at=admin["created_at"].isoformat() if admin["created_at"] else None,
+        auto_assigned_client=admin.get("auto_assigned_client"),
     )
 
 
@@ -138,7 +140,30 @@ def delete_admin(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-# --- Liste des Clients ---
+@router.post("/clients", response_model=ClientDetailResponse, status_code=201)
+def create_client(
+    data: ClientCreateRequest,
+    current_user=Depends(require_admin),
+    db: Connection = Depends(get_db),
+):
+    """Création d'un client.
+    - Super Admin : peut créer tout client.
+    - Admin classique : peut créer un client ; le client est automatiquement
+      affecté à cet admin classique (ajout dans admin_clients).
+    """
+    service = UserService(db)
+    try:
+        client = service.create_client(data, current_user.user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    # Si c'est un admin classique, l'affecter immédiatement à ce client
+    from app.services.scope import is_regular_admin
+    if is_regular_admin(current_user):
+        try:
+            service.assign_admin_to_client(current_user.user_id, client["client_code"], current_user.user_id)
+        except ValueError:
+            pass
+    return _client_item(client)
 
 
 @router.get("/clients", response_model=ClientListResponse)
@@ -198,17 +223,24 @@ def get_client(
 def update_client_license(
     client_code: str,
     data: ClientLicenseUpdateRequest,
-    current_user=Depends(require_superadmin),
+    current_user=Depends(require_admin),
     db: Connection = Depends(get_db),
 ):
     """Mise à jour des quotas de licences (sites / postes) d'un client.
 
-    Réservé au Super Admin.
+    Super Admin : n'importe quel client.
+    Admin classique : uniquement les clients qui lui sont affectés
+    (403 sinon, contrôlé côté serveur).
     """
     service = UserService(db)
     client = service.get_client_by_code(client_code.upper())
     if not client:
         raise HTTPException(status_code=404, detail="Client introuvable.")
+    if not _client_in_scope(client_scope(db, current_user), client_code):
+        raise HTTPException(
+            status_code=403,
+            detail="Vous n'êtes pas autorisé à gérer ce client.",
+        )
     try:
         updated = service.update_client_license(
             client["client_id"], data.license_sites, data.license_posts,

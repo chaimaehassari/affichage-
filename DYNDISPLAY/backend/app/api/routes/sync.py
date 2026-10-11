@@ -10,7 +10,13 @@ from app.db.database import get_db, get_sync_connection
 from app.dependencies.auth import require_permission
 from app.schemas.sync import SyncJobOut, SyncJobCreate
 from app.services.sync_service import SyncService
-from app.services.scope import assert_group_access, assert_post_scope
+from app.services.scope import (
+    assert_group_access,
+    assert_media_in_scope,
+    assert_post_scope,
+    client_scope,
+    scoped_post_ids,
+)
 from app.services.sync_executor import sync_executor
 from app.core.times import to_utc
 
@@ -180,13 +186,17 @@ def sync_group(
     if not group:
         raise HTTPException(status_code=404, detail="Groupe introuvable.")
 
-    post_ids = [
-        r["post_id"]
-        for r in db.execute(
-            "SELECT post_id FROM screen_group_posts WHERE group_id = %s ORDER BY post_id",
-            (group_id,),
-        ).fetchall()
-    ]
+    post_ids = scoped_post_ids(
+        db,
+        [
+            r["post_id"]
+            for r in db.execute(
+                "SELECT post_id FROM screen_group_posts WHERE group_id = %s ORDER BY post_id",
+                (group_id,),
+            ).fetchall()
+        ],
+        client_scope(db, current_user),
+    )
     if not post_ids:
         raise HTTPException(status_code=400, detail="Le groupe ne contient aucun poste.")
 
@@ -278,13 +288,29 @@ def sync_group_media(
     if not media:
         raise HTTPException(status_code=404, detail="Média introuvable.")
 
-    post_ids = [
-        r["post_id"]
-        for r in db.execute(
-            "SELECT post_id FROM screen_group_posts WHERE group_id = %s ORDER BY post_id",
-            (group_id,),
-        ).fetchall()
-    ]
+    # Le média doit être dans MON périmètre : l'accès au groupe ne vaut pas
+    # accès à tous ses médias. Sans ce contrôle, un client pouvait déclencher
+    # la synchronisation d'un média d'un autre client vers SES propres postes
+    # (et donc le pousser en SFTP chez lui).
+    try:
+        assert_media_in_scope(db, client_scope(db, current_user),
+                              current_user.user_id, media_id)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    post_ids = scoped_post_ids(
+        db,
+        [
+            r["post_id"]
+            for r in db.execute(
+                "SELECT post_id FROM screen_group_posts WHERE group_id = %s ORDER BY post_id",
+                (group_id,),
+            ).fetchall()
+        ],
+        client_scope(db, current_user),
+    )
     if not post_ids:
         raise HTTPException(status_code=400, detail="Le groupe ne contient aucun poste.")
 

@@ -47,7 +47,9 @@ def decode_access_token(token: str) -> dict | None:
     Les tokens média (typ=media) ne doivent JAMAIS être acceptés comme token
     d'API : ils circulent dans des URL et sont de simples accès signés à un
     fichier. La vérification stricte de `typ` empêche un token média volé
-    d'être réutilisé comme session.
+    d'être réutilisé comme session. Un token de renouvellement (typ=refresh)
+    est également refusé ici : il sert UNIQUEMENT à obtenir un nouveau token
+    d'accès, jamais à appeler l'API.
     """
     try:
         payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
@@ -56,6 +58,37 @@ def decode_access_token(token: str) -> dict | None:
     except jwt.InvalidTokenError:
         return None
     if payload.get("typ") != "access":
+        return None
+    return payload
+
+
+def create_refresh_token(user_id: int) -> str:
+    """Token de renouvellement (typ=refresh), durée de vie longue.
+
+    Émis au login avec le token d'accès. Le client ne s'en sert que pour
+    renouveler un accès expiré, via POST /auth/refresh. Volé, il donne accès
+    à l'API pendant toute sa durée de vie : d'où une durée bien plus courte
+    que celle d'un mot de passe, et la possibilité de le révoquer en
+    réinitialisant le secret JWT.
+    """
+    expire = datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+    payload = {
+        "sub": str(user_id),
+        "typ": "refresh",
+        "exp": expire,
+    }
+    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
+def decode_refresh_token(token: str) -> dict | None:
+    """Décode un token de RENOUVELLEMENT uniquement (typ=refresh)."""
+    try:
+        payload = jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+    if payload.get("typ") != "refresh":
         return None
     return payload
 

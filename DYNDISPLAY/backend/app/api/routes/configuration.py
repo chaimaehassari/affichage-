@@ -12,7 +12,7 @@ from app.schemas.configuration import (
     ZoneMediaAssignment,
 )
 from app.services.configuration_service import ConfigurationService, ScheduleService
-from app.services.scope import assert_post_scope
+from app.services.scope import assert_post_scope, client_scope
 
 router = APIRouter(prefix="/api/v1", tags=["Configuration"])
 
@@ -58,7 +58,8 @@ def update_post_configuration(
     _assert_post_scope(db, current_user, post_id)
     service = ConfigurationService(db)
     try:
-        return service.update_configuration(post_id, data, user_id=current_user.user_id)
+        return service.update_configuration(post_id, data, user_id=current_user.user_id,
+                                             scope=client_scope(db, current_user))
     except PermissionError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except ValueError as e:
@@ -75,7 +76,8 @@ def update_post_zones(
     _assert_post_scope(db, current_user, post_id)
     service = ConfigurationService(db)
     try:
-        service.update_zones(post_id, zones, user_id=current_user.user_id)
+        service.update_zones(post_id, zones, user_id=current_user.user_id,
+                             scope=client_scope(db, current_user))
         return {"message": "Zones mises à jour avec succès."}
     except PermissionError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))

@@ -26,12 +26,22 @@ def _layout_out(layout) -> LayoutOut:
     )
 
 
-@router.get("/layouts", response_model=list[LayoutOut])
+@router.get("/layouts", response_model=list[LayoutOut] | list[LayoutDetailOut])
 def list_layouts(
+    include_zones: bool = False,
     current_user=Depends(require_permission("menu_conception")),
     db: Connection = Depends(get_db),
 ):
+    """Liste les modèles de découpage.
+
+    `include_zones=true` renvoie en plus les zones de chaque modèle. L'écran de
+    configuration en a besoin pour tous les modèles, pas seulement celui
+    sélectionné : sans ce lot, il déclenchait un GET /layouts/{id} par modèle
+    (plus de 700 requêtes en série), chacune avec son propre risque de 401.
+    """
     service = LayoutService(db)
+    if include_zones:
+        return service.list_layouts_with_zones()
     return [_layout_out(l) for l in service.list_layouts()]
 
 
@@ -41,6 +51,12 @@ def create_layout(
     current_user=Depends(require_permission("menu_conception")),
     db: Connection = Depends(get_db),
 ):
+    """Crée un modèle de découpage.
+
+    Accessible à tout utilisateur disposant de la permission `menu_conception`
+    (l'écran Découpage) : chaque utilisateur autorisé peut enregistrer son
+    propre modèle.
+    """
     service = LayoutService(db)
     try:
         layout = service.create_layout(data)
@@ -69,6 +85,7 @@ def update_layout(
     current_user=Depends(require_permission("menu_conception")),
     db: Connection = Depends(get_db),
 ):
+    """Modifie un modèle — accessible à tout utilisateur avec `menu_conception`."""
     service = LayoutService(db)
     try:
         service.update_layout(layout_id, data)
@@ -83,6 +100,7 @@ def delete_layout(
     current_user=Depends(require_permission("menu_conception")),
     db: Connection = Depends(get_db),
 ):
+    """Supprime un modèle — accessible à tout utilisateur avec `menu_conception`."""
     service = LayoutService(db)
     try:
         service.delete_layout(layout_id)

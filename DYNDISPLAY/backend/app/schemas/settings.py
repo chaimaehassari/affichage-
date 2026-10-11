@@ -2,6 +2,8 @@ import re
 
 from pydantic import BaseModel, field_validator
 
+from app.core.license_utils import CLIENT_CODE_MAX_LENGTH, normalize_client_code
+
 
 class SettingsOut(BaseModel):
     license_sites: int = 50
@@ -26,8 +28,6 @@ class SettingsOut(BaseModel):
 
 
 class SettingsUpdate(BaseModel):
-    license_sites: int | None = None
-    license_posts: int | None = None
     code_client: str | None = None
     sync_auto_enabled: bool | None = None
     sync_auto_mode: str | None = None
@@ -47,6 +47,27 @@ class SettingsUpdate(BaseModel):
     smtp_from: str | None = None
     app_base_url: str | None = None
 
+    @field_validator("code_client")
+    @classmethod
+    def validate_code_client(cls, v):
+        """Même règle que l'app « Licence T2F » : lettres + chiffres, 8 max.
+
+        Accepte « ABC123 », « T2F2026 », « CLT001A » ; normalise en
+        majuscules et rejette les caractères spéciaux comme les codes de plus
+        de 8 caractères. Le code est signé tel quel dans la licence : le
+        backend ne doit pas pouvoir enregistrer une valeur que l'app T2F
+        refuserait de signer.
+        """
+        if v is None:
+            return v
+        code = normalize_client_code(v)
+        if code is None:
+            raise ValueError(
+                f"Code client : lettres et chiffres uniquement, "
+                f"{CLIENT_CODE_MAX_LENGTH} caractères maximum."
+            )
+        return code
+
 
 class ClientCodeVerify(BaseModel):
     code: str
@@ -54,11 +75,6 @@ class ClientCodeVerify(BaseModel):
 
 class AccessPasswordVerify(BaseModel):
     password: str
-
-
-class ChangeAccessPasswordRequest(BaseModel):
-    current_password: str
-    new_password: str
 
 
 class ChangePasswordRequest(BaseModel):
@@ -85,12 +101,6 @@ class ChangePasswordRequest(BaseModel):
 
 class RegenerateClientCodeRequest(BaseModel):
     pass
-
-
-class LicenseUpdateRequest(BaseModel):
-    code: str
-    sites: int
-    posts: int
 
 
 class FtpProfileCreate(BaseModel):
@@ -141,35 +151,5 @@ class FtpTestRequest(BaseModel):
 
 
 class FtpTestResult(BaseModel):
-    success: bool
-    message: str
-
-
-class AccountDeviceOut(BaseModel):
-    user_id: int
-    login: str
-    user_code: str | None = None
-    profile_name: str
-    is_superadmin: bool = False
-    account_code: str | None = None
-    requires_activation: bool = False
-    authorized_device_id: str | None = None
-    activated_at: str | None = None
-    created_at: str | None = None
-
-
-class AccountDeviceListResponse(BaseModel):
-    accounts: list[AccountDeviceOut]
-    total: int
-    license_posts: int
-    activated_accounts: int
-    available_slots: int
-
-
-class RevokeDeviceRequest(BaseModel):
-    pass
-
-
-class RevokeDeviceResponse(BaseModel):
     success: bool
     message: str

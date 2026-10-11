@@ -8,7 +8,13 @@ from app.schemas.auth import (
     UserUpdateRequest,
 )
 from app.services.audit_service import log_action
-from app.services.scope import scope_sql, site_in_scope
+from app.services.scope import (
+    admin_owned_users_sql,
+    profile_level,
+    scope_as_list,
+    scope_sql,
+    site_in_scope,
+)
 
 MAX_PASSWORD_HISTORY = 3
 PASSWORD_EXPIRY_MONTHS = 3
@@ -25,36 +31,51 @@ class UserService:
     def list_users(self, search: str | None = None, scope=None, owner_user_id: int | None = None) -> list[dict]:
         sql = """
             SELECT u.user_id, u.user_code, u.login, u.email, u.profile_id, u.is_active,
-                   u.is_activated, u.is_superadmin, u.sites_limit, u.posts_limit, u.activated_at,
+                   u.is_superadmin,
                    u.created_at, p.name AS profile_name, u.admin_id,
                    COALESCE(
                      (SELECT adm.login FROM users adm WHERE adm.user_id = u.admin_id),
                      (SELECT adm2.login FROM admin_clients ac
+                      JOIN clients c ON c.code_client = ac.client_code
                       JOIN users adm2 ON adm2.user_id = ac.admin_id
-                      WHERE ac.client_code = u.user_code LIMIT 1)
+                      WHERE c.id = u.client_id LIMIT 1)
                    ) AS admin_login,
                    COALESCE(
                      (SELECT adm3.user_code FROM users adm3 WHERE adm3.user_id = u.admin_id),
                      (SELECT adm4.user_code FROM admin_clients ac
+                      JOIN clients c ON c.code_client = ac.client_code
                       JOIN users adm4 ON adm4.user_id = ac.admin_id
-                      WHERE ac.client_code = u.user_code LIMIT 1)
+                      WHERE c.id = u.client_id LIMIT 1)
                    ) AS admin_code,
-                   (SELECT COALESCE(uu.login, '') FROM users uu
-                    WHERE uu.user_code = u.user_code AND uu.user_code IS NOT NULL
-                    ORDER BY uu.user_id LIMIT 1) AS client_name
+                   (SELECT COALESCE(cl.nom_client, '') FROM clients cl
+                    WHERE cl.id = u.client_id LIMIT 1) AS client_name
             FROM users u
             LEFT JOIN profiles p ON p.profile_id = u.profile_id
         """
         params = []
         where = []
         if owner_user_id is not None:
-            where.append("u.admin_id = %s")
-            params.append(owner_user_id)
-        elif scope is not None and scope != "":
-            frag, args = scope_sql(scope, "u.user_code")
-            if frag:
-                where.append(frag.lstrip(" AND "))
+            # Admin classique : la regle vit dans `admin_owned_users_sql()`,
+            # partagee avec `target_user_in_scope()`. Les deux doivent rester
+            # identiques, sinon un compte masque dans la liste resterait
+            # manipulable via son ID (GET/PUT/DELETE /users/{id}).
+            frag, args = admin_owned_users_sql(owner_user_id)
+            where.append(frag)
             params.extend(args)
+        elif scope is not None and scope != "":
+            # Compte client : uniquement les comptes rattaches a SON code
+            # client. Filtrer aussi sur `users.user_code` exposait des
+            # comptes d'autres clients (c'est le code du compte, pas le
+            # code client) ; un code vide ne doit rien renvoyer.
+            codes = scope_as_list(scope)
+            if codes:
+                where.append(
+                    "u.client_id IN (SELECT c.id FROM clients c "
+                    "WHERE c.code_client = ANY(%s))"
+                )
+                params.append(codes)
+            else:
+                where.append("1 = 0")
         if search:
             term = f"%{search}%"
             where.append("(u.login ILIKE %s OR u.user_code ILIKE %s OR u.user_id::text ILIKE %s)")
@@ -141,10 +162,15 @@ class UserService:
             raise ValueError("Aucun client configuré : créez un client avant d'ajouter des comptes.")
         return row["id"]
 
-    def _resolve_client_id(self, client_code: str | None) -> int:
+    def _resolve_client_id(self, client_code: str | None,
+                           fallback_id: int | None = None) -> int:
         """Rattachement explicite d'un compte à un client.
 
         - user_code correspondant à un code_client → ce client ;
+        - `fallback_id` fourni (édition d'un compte existant) → le client
+          actuel : sans ce repli, éditer un compte dont le `user_code` n'est
+          pas un `code_client` le faisait basculer silencieusement sur le
+          client par défaut, donc hors du périmètre de son admin ;
         - sinon → du Client par défaut (rattachement réel en base, jamais
           de compte « sans client »). Après migration 019, client_id NOT NULL.
         """
@@ -155,7 +181,57 @@ class UserService:
             ).fetchone()
             if row:
                 return row["id"]
+        if fallback_id:
+            return fallback_id
         return self._default_client_id()
+
+    def _validate_profile_id(self, profile_id: int) -> str:
+        """Vérifie qu'un `profile_id` désigne un profil existant et actif.
+
+        Sans ce contrôle, un identifiant de profil inexistant (ou un futur
+        profil plateforme) était écrit tel quel dans `users.profile_id`, créant
+        un compte dont le nom de profil était vide — donc sans droits et sans
+        rattachement cohérent.
+        """
+        row = self.conn.execute(
+            "SELECT name FROM profiles WHERE profile_id = %s AND is_active = TRUE",
+            (profile_id,),
+        ).fetchone()
+        if not row:
+            raise ValueError("Profil invalide ou inactif.")
+        return row["name"]
+
+    def _assert_profile_assignable(self, actor_user_id: int, profile_name: str) -> None:
+        """Applique la règle 2.4 : profils égaux ou inférieurs, jamais plateforme.
+
+        - Super Admin → aucun plafond.
+        - Admin client (profil Administrateur non superadmin) → il ne peut créer
+          que des profils de niveau supérieur ou égal au sien (donc égaux ou
+          inférieurs en autorité), et JAMAIS un profil hors de la table des
+          profils clients (réservé à la plateforme).
+        - Un `profile_name` absent de `PROFILE_LEVELS` n'est pas un profil client :
+          il n'est attribuable que par un Super Admin.
+        """
+        actor = self.conn.execute(
+            """
+            SELECT u.is_superadmin, p.name AS profile_name
+            FROM users u
+            LEFT JOIN profiles p ON p.profile_id = u.profile_id
+            WHERE u.user_id = %s
+            """,
+            (actor_user_id,),
+        ).fetchone()
+        if actor and actor.get("is_superadmin"):
+            return
+
+        actor_level = profile_level(actor["profile_name"] if actor else None)
+        target_level = profile_level(profile_name)
+        if target_level is None:
+            raise ValueError("Ce profil est réservé à la plateforme.")
+        if actor_level is not None and target_level < actor_level:
+            raise ValueError(
+                "Vous ne pouvez attribuer qu'un profil de votre niveau ou inférieur."
+            )
 
     def create_user(self, data: UserCreateRequest, admin_user_id: int) -> dict:
         existing = self.get_user_by_login(data.login)
@@ -166,6 +242,9 @@ class UserService:
             existing_email = self.get_user_by_email(data.email)
             if existing_email:
                 raise ValueError("Cette adresse e-mail est déjà utilisée.")
+
+        profile_name = self._validate_profile_id(data.profile_id)
+        self._assert_profile_assignable(admin_user_id, profile_name)
 
         if data.user_code:
             is_client_code = self.conn.execute(
@@ -198,21 +277,18 @@ class UserService:
                 raise ValueError("Le code admin doit désigner un utilisateur de profil Administrateur.")
 
         password_hash = hash_password(data.password)
-        from app.core.license_utils import generate_account_code
-        account_code = generate_account_code()
         is_supreme = bool(getattr(data, "is_superadmin", False))
         client_id = self._resolve_client_id(data.user_code)
         row = self.conn.execute(
             """
             INSERT INTO users (profile_id, user_code, login, email, password_hash,
-                               is_active, must_change_password, is_activated, is_superadmin,
-                               account_code, requires_activation, admin_id, client_id)
-            VALUES (%s, %s, %s, %s, %s, %s, TRUE, %s, %s, %s, %s, %s, %s)
+                               is_active, must_change_password, is_superadmin,
+                               admin_id, client_id)
+            VALUES (%s, %s, %s, %s, %s, %s, TRUE, %s, %s, %s)
             RETURNING user_id
             """,
             (data.profile_id, data.user_code or None, data.login, data.email or None,
-             password_hash, data.is_active, not data.requires_activation, is_supreme,
-             account_code, not is_supreme,
+             password_hash, data.is_active, is_supreme,
              data.admin_id, client_id),
         ).fetchone()
         user_id = row["user_id"]
@@ -226,6 +302,15 @@ class UserService:
             "user", user_id,
             f"Création de l'utilisateur {data.login}",
         )
+        # Règle 2.4 : toute création d'un compte ADMINISTRATEUR (par un admin
+        # client comme par le Super Admin) laisse une trace dédiée et
+        # recherchable, en plus du journal générique `user_create`.
+        if profile_name == "Administrateur":
+            log_action(
+                self.conn, admin_user_id, "admin_create",
+                "user", user_id,
+                f"Création de l'administrateur {data.login}",
+            )
         return self.get_user(user_id)
 
     # --- Update user ---
@@ -234,6 +319,9 @@ class UserService:
         user = self.get_user(user_id)
         if not user:
             raise ValueError("Utilisateur introuvable.")
+
+        profile_name = self._validate_profile_id(data.profile_id)
+        self._assert_profile_assignable(admin_user_id, profile_name)
 
         if data.login != user["login"]:
             existing = self.get_user_by_login(data.login)
@@ -272,16 +360,23 @@ class UserService:
             if not admin_profile or admin_profile["name"] != "Administrateur":
                 raise ValueError("Le code admin doit désigner un utilisateur de profil Administrateur.")
 
-        client_id = self._resolve_client_id(data.user_code)
+        # `user_code` n'est pas un champ optionnel du PUT : c'est l'identifiant
+        # de rattachement du compte a son client, et il est verifie au login
+        # (`client_code`). Ecraser le code existant par NULL parce que le champ
+        # est absent du corps rendait le compte incapable de se connecter apres
+        # la moindre edition. On ne touche donc au code que s'il est fourni.
+        user_code = (data.user_code or "").strip() or user.get("user_code")
+        client_id = self._resolve_client_id(user_code, fallback_id=user.get("client_id"))
         self.conn.execute(
             """
             UPDATE users
             SET login = %s, profile_id = %s, user_code = %s, email = %s, is_active = %s,
-                is_activated = %s, admin_id = %s, client_id = %s, updated_at = %s
+                admin_id = %s, client_id = %s, updated_at = %s
             WHERE user_id = %s
             """,
-            (data.login, data.profile_id, data.user_code or None, data.email or None,
-             data.is_active, not data.requires_activation, data.admin_id, client_id,
+            (data.login, data.profile_id, user_code or None, data.email or None,
+             data.is_active,
+             data.admin_id, client_id,
              datetime.now(timezone.utc), user_id),
         )
 
@@ -362,6 +457,37 @@ class UserService:
             (user_id,),
         ).fetchone()
 
+    def _client_code_by_id(self, client_id: int | None) -> str | None:
+        if not client_id:
+            return None
+        row = self.conn.execute(
+            "SELECT code_client FROM clients WHERE id = %s",
+            (client_id,),
+        ).fetchone()
+        return row["code_client"] if row else None
+
+    def _resolve_admin_client_codes(
+        self, client_codes, client_id: int | None, is_supreme: bool
+    ) -> list[str]:
+        """Détermine les clients d'un Admin classique, avec repli explicite.
+
+        `admin_clients` est la SEULE source du périmètre d'un Admin classique
+        (cf. scope.admin_client_codes). Un admin enregistré sans ligne ici est
+        un compte mort : il ne voit aucun client et `POST /users` refuse avec
+        « Aucun client ne vous est affecté ».
+
+        Donc, si aucun client n'est sélectionné, on rattache l'admin au client
+        déjà résolu pour lui (`users.client_id`, cf. _resolve_client_id). Le
+        compte est immédiatement utilisable, et le périmètre reste strictement
+        borné à un client — jamais global. Le Super Admin n'a pas de périmètre
+        à renseigner : son `user_code` peut ne correspondre à aucun client.
+        """
+        codes = [(c or "").strip().upper() for c in (client_codes or []) if (c or "").strip()]
+        if codes or is_supreme:
+            return codes
+        fallback = self._client_code_by_id(client_id)
+        return [fallback] if fallback else []
+
     def create_admin(self, data, admin_user_id: int) -> dict:
         existing = self.conn.execute(
             "SELECT user_id FROM users WHERE login = %s",
@@ -388,32 +514,41 @@ class UserService:
             raise ValueError("Profil Administrateur introuvable.")
 
         password_hash = hash_password(data.password)
-        from app.core.license_utils import generate_account_code
-        account_code = generate_account_code()
         is_supreme = bool(getattr(data, "is_superadmin", False))
         client_id = self._resolve_client_id(data.user_code)
         row = self.conn.execute(
             """
             INSERT INTO users (profile_id, user_code, login, email, password_hash,
-                               is_active, must_change_password, is_activated, is_superadmin,
-                               account_code, requires_activation, client_id)
-            VALUES (%s, %s, %s, %s, %s, %s, TRUE, %s, %s, %s, %s, %s)
+                               is_active, must_change_password, is_superadmin,
+                               client_id)
+            VALUES (%s, %s, %s, %s, %s, %s, TRUE, %s, %s)
             RETURNING user_id
             """,
             (profile["profile_id"], data.user_code or None, data.login,
-             data.email or None, password_hash, data.is_active, not is_supreme, is_supreme,
-             account_code, not is_supreme, client_id),
+             data.email or None, password_hash, data.is_active, is_supreme,
+             client_id),
         ).fetchone()
         user_id = row["user_id"]
 
-        self._save_admin_clients(user_id, data.client_codes)
+        requested_codes = [c for c in (data.client_codes or []) if (c or "").strip()]
+        effective_codes = self._resolve_admin_client_codes(
+            requested_codes, client_id, is_supreme
+        )
+        self._save_admin_clients(user_id, effective_codes)
+        auto_assigned = (
+            effective_codes[0]
+            if (not requested_codes and not is_supreme and effective_codes)
+            else None
+        )
 
         log_action(
             self.conn, admin_user_id, "admin_create",
             "user", user_id,
             f"Création de l'admin {data.login}",
         )
-        return self.get_admin(user_id)
+        admin = self.get_admin(user_id)
+        admin["auto_assigned_client"] = auto_assigned
+        return admin
 
     def update_admin(self, user_id: int, data, admin_user_id: int) -> dict:
         admin = self.get_admin(user_id)
@@ -439,24 +574,38 @@ class UserService:
         if admin["is_superadmin"]:
             raise ValueError("Le Super Admin ne peut pas être modifié comme un Admin classique.")
 
+        client_id = self._resolve_client_id(data.user_code,
+                                            fallback_id=admin.get("client_id"))
         self.conn.execute(
             """
             UPDATE users
-            SET login = %s, user_code = %s, email = %s, is_active = %s, updated_at = %s
+            SET login = %s, user_code = %s, email = %s, is_active = %s, client_id = %s,
+                updated_at = %s
             WHERE user_id = %s
             """,
             (data.login, data.user_code or None, data.email or None,
-             data.is_active, datetime.now(timezone.utc), user_id),
+             data.is_active, client_id, datetime.now(timezone.utc), user_id),
         )
 
-        self._save_admin_clients(user_id, data.client_codes)
+        effective_codes = self._resolve_admin_client_codes(
+            data.client_codes, client_id, False
+        )
+        self._save_admin_clients(user_id, effective_codes)
+        auto_assigned = (
+            effective_codes[0]
+            if (not [c for c in (data.client_codes or []) if (c or "").strip()]
+                and effective_codes)
+            else None
+        )
 
         log_action(
             self.conn, admin_user_id, "admin_update",
             "user", user_id,
             f"Modification de l'admin {data.login}",
         )
-        return self.get_admin(user_id)
+        admin = self.get_admin(user_id)
+        admin["auto_assigned_client"] = auto_assigned
+        return admin
 
     def delete_admin(self, user_id: int, admin_user_id: int) -> None:
         admin = self.get_admin(user_id)
@@ -547,7 +696,6 @@ class UserService:
                      WHERE u.client_id = c.id) AS user_count,
                    (SELECT COUNT(*) FROM users u
                      WHERE u.client_id = c.id
-                       AND u.requires_activation = FALSE
                        AND COALESCE(u.is_superadmin, FALSE) = FALSE) AS activated_count,
                    (SELECT u.login FROM users u
                      WHERE u.client_id = c.id
@@ -606,6 +754,82 @@ class UserService:
             f"Licences du client {client['code_client']} : "
             f"{license_sites} sites / {license_posts} postes",
         )
+        return self.get_client(client_id)
+
+    def create_client(self, data, admin_user_id: int) -> dict:
+        code = (data.client_code or "").strip().upper()
+        if not code:
+            raise ValueError("Le code client est obligatoire.")
+        existing = self.conn.execute(
+            "SELECT id FROM clients WHERE code_client = %s",
+            (code,),
+        ).fetchone()
+        if existing:
+            raise ValueError(f"Client {code} existe déjà.")
+        name = (data.client_name or code).strip()
+        license_sites = data.license_sites
+        license_posts = data.license_posts
+        if not license_sites and not license_posts:
+            # Aucune licence précisée : on reprend les valeurs par défaut de la
+            # plateforme (Paramètres), sinon le client naîtrait en 0/0 et ne
+            # pourrait activer aucun compte.
+            from app.services.settings_service import SettingsService
+
+            defaults = SettingsService(self.conn).get_all_settings()
+            license_sites = defaults["license_sites"]
+            license_posts = defaults["license_posts"]
+        row = self.conn.execute(
+            """
+            INSERT INTO clients (code_client, nom_client, license_sites, license_posts)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id
+            """,
+            (code, name, license_sites, license_posts),
+        ).fetchone()
+        client_id = row["id"]
+        log_action(
+            self.conn, admin_user_id, "client_create",
+            "client", client_id,
+            f"Création du client {code}" + (f" - {name}" if name else ""),
+        )
+        return self.get_client(client_id)
+
+    def get_or_create_client(self, code: str, admin_user_id: int) -> dict:
+        """Retourne le client `code`, en le créant au besoin.
+
+        Utilisé quand un Admin classique saisit un code client inconnu : le
+        client est créé avec les licences par défaut de la plateforme puis
+        rattaché à cet admin (voir `admin_clients`), qui en devient
+        l'administrateur. Un code déjà existant est simplement retourné.
+        """
+        code = (code or "").strip().upper()
+        if not code:
+            raise ValueError("Le code client est obligatoire.")
+        row = self.conn.execute(
+            "SELECT id FROM clients WHERE code_client = %s",
+            (code,),
+        ).fetchone()
+        if row is None:
+            from app.services.settings_service import SettingsService
+
+            defaults = SettingsService(self.conn).get_all_settings()
+            row = self.conn.execute(
+                """
+                INSERT INTO clients (code_client, nom_client, license_sites, license_posts)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id
+                """,
+                (code, code, defaults["license_sites"], defaults["license_posts"]),
+            ).fetchone()
+            log_action(
+                self.conn, admin_user_id, "client_create",
+                "client", row["id"],
+                f"Création automatique du client {code}",
+            )
+        client_id = row["id"]
+        admin = self.get_admin(admin_user_id)
+        if admin and not admin.get("is_superadmin"):
+            self.assign_admin_to_client(admin_user_id, code, admin_user_id)
         return self.get_client(client_id)
 
     def assign_admin_to_client(self, admin_id: int, client_code: str, admin_user_id: int) -> None:

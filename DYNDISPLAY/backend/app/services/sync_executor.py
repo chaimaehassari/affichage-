@@ -44,7 +44,20 @@ JOB_COMMIT_WAIT_SECONDS = 5.0
 JOB_COMMIT_POLL_SECONDS = 0.05
 
 
-def run_sync_task(post_id: int, job_id: int, media_ids: list[int] | None = None) -> bool:
+def _post_exists(post_id: int) -> bool:
+    """Le poste cible existe-t-il encore en base ?"""
+    try:
+        with get_sync_connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM posts WHERE post_id = %s", (post_id,)
+            ).fetchone()
+        return row is not None
+    except Exception:
+        # Incapable de trancher : on ne pretend pas que le poste a disparu.
+        return True
+
+
+def run_sync_task(post_id: int, job_id: int, media_ids: list[int] | None = None):
     """Runner commun à tous les chemins de sync.
 
     Ouvre la connexion via le pool dédié gesto-sync (jamais une connexion
@@ -52,9 +65,22 @@ def run_sync_task(post_id: int, job_id: int, media_ids: list[int] | None = None)
     quelle que soit la famille d'appel.
 
     Garde anti-course : on attend que la ligne sync_jobs soit visible avant de
-    lancer run_sync (voir JOB_COMMIT_WAIT_SECONDS). Si elle n'apparaît jamais,
-    on rend False : le job est compté en échec par l'appelant (et sera repris
-    par recover_orphan_jobs s'il existe réellement).
+    lancer run_sync (voir JOB_COMMIT_WAIT_SECONDS).
+
+    Trois issues, et non deux — la distinction est importante parce que le
+    compteur d'échecs est lu par les tests et par /sync/load :
+
+    * ``True``  : la sync a été exécutée ;
+    * ``False`` : vrai échec (exception, ou job absent alors que le poste
+      existe encore = anomalie réelle) ;
+    * ``None``  : job **annulé**, parce que le poste a été supprimé entre-temps.
+      ``sync_jobs`` part en CASCADE avec ``posts`` : le job n'existe plus,
+      ce qui est le comportement attendu d'une suppression et non une panne.
+
+    Ce dernier cas se produit dès qu'un lot de tests fait
+    « création -> sync -> suppression » rapide : les workers saturés ne
+    traitent le job qu'après le DELETE, le job a disparu, et l'ancien code
+    journalisait « soumission fantôme » en ERROR tout en comptant un échec.
     """
     deadline = time.monotonic() + JOB_COMMIT_WAIT_SECONDS
     while True:
@@ -66,6 +92,13 @@ def run_sync_task(post_id: int, job_id: int, media_ids: list[int] | None = None)
         if job is not None:
             break
         if time.monotonic() >= deadline:
+            if not _post_exists(post_id):
+                logger.info(
+                    "Job %s annulé : le poste %s a été supprimé avant exécution "
+                    "(sync_jobs supprimé en CASCADE) — ce n'est pas un échec.",
+                    job_id, post_id,
+                )
+                return None
             logger.error(
                 "Job %s (post %s) jamais visible après %ss — soumission fantôme, abandon",
                 job_id, post_id, JOB_COMMIT_WAIT_SECONDS,
@@ -110,7 +143,12 @@ class BoundedSyncExecutor:
             self._running.add(job_id)
         ok = False
         try:
-            ok = run_sync_task(post_id, job_id, media_ids)
+            # run_sync_task rend True (fait), False (echec reel) ou None (job
+            # annule car le poste a ete supprime) : un job annule n'est PAS un
+            # echec, sinon la suppression d'un posteDepuis la suite de tests
+            # fait grimper le compteur d'echecs sans aucune panne.
+            outcome = run_sync_task(post_id, job_id, media_ids)
+            ok = outcome is None or bool(outcome)
         except Exception:
             logger.exception("run_sync_task raised for job %s (post %s)", job_id, post_id)
         finally:
